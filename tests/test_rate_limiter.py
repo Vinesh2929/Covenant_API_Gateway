@@ -1,168 +1,117 @@
 """
-tests/test_rate_limiter.py
+tests/test_rate_limiter.py — sliding-window rate limiter tests.
 
-Unit tests for gateway/rate_limiter.py — sliding-window rate limiting.
-
-Uses fakeredis so no real Redis instance is required.
-
-Test coverage goals:
-  - Requests within the window limit are allowed.
-  - The (max_requests + 1)th request raises RateLimitExceeded.
-  - RateLimitExceeded carries the correct retry_after value.
-  - Requests older than window_seconds are not counted (window slides).
-  - Different keys have independent counters.
-  - peek() returns the correct (used, remaining, reset_at) without consuming quota.
-  - reset() clears the window for a key.
-  - Concurrent requests from multiple coroutines do not exceed the limit
-    (atomicity test via asyncio.gather).
+Uses fakeredis via the conftest rate_limiter fixture.
 """
 
 from __future__ import annotations
 
 import asyncio
-import time
 
 import pytest
 
-from gateway.rate_limiter import RateLimiter, RateLimitExceeded, WindowConfig
+from gateway.rate_limiter import RateLimitExceeded, WindowConfig
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def window_config() -> WindowConfig:
-    """A tight window for fast tests: 5 requests per 10 seconds."""
     return WindowConfig(max_requests=5, window_seconds=10, key_prefix="test")
 
 
-# ---------------------------------------------------------------------------
-# Basic allow / deny
-# ---------------------------------------------------------------------------
-
 class TestBasicLimiting:
-    """Core allow/deny behaviour."""
 
     @pytest.mark.asyncio
-    async def test_requests_within_limit_are_allowed(
-        self, rate_limiter, window_config
-    ):
-        """
-        The first max_requests calls to check() should not raise.
-        """
-        # TODO: implement
-        ...
+    async def test_requests_within_limit_are_allowed(self, rate_limiter, window_config):
+        for _ in range(window_config.max_requests):
+            await rate_limiter.check(key="user-a", config=window_config)
 
     @pytest.mark.asyncio
     async def test_request_exceeding_limit_raises(self, rate_limiter, window_config):
-        """
-        The (max_requests + 1)th call to check() should raise RateLimitExceeded.
-        """
-        # TODO: implement
-        ...
+        for _ in range(window_config.max_requests):
+            await rate_limiter.check(key="user-b", config=window_config)
+
+        with pytest.raises(RateLimitExceeded):
+            await rate_limiter.check(key="user-b", config=window_config)
 
     @pytest.mark.asyncio
-    async def test_rate_limit_exceeded_has_retry_after(
-        self, rate_limiter, window_config
-    ):
-        """
-        RateLimitExceeded.retry_after should be a positive float indicating
-        when the window resets.
-        """
-        # TODO: implement
-        ...
+    async def test_rate_limit_exceeded_has_retry_after(self, rate_limiter, window_config):
+        for _ in range(window_config.max_requests):
+            await rate_limiter.check(key="user-c", config=window_config)
 
+        with pytest.raises(RateLimitExceeded) as exc_info:
+            await rate_limiter.check(key="user-c", config=window_config)
 
-# ---------------------------------------------------------------------------
-# Window sliding
-# ---------------------------------------------------------------------------
+        assert exc_info.value.retry_after >= 0
+        assert exc_info.value.limit == window_config.max_requests
+        assert exc_info.value.window == window_config.window_seconds
 
-class TestWindowSliding:
-    """Verify the sliding-window behaviour (old requests drop off)."""
-
-    @pytest.mark.asyncio
-    async def test_old_requests_not_counted(self, rate_limiter, window_config, freezegun):
-        """
-        After window_seconds pass, old requests should no longer count against
-        the limit, allowing new requests through.
-        """
-        # TODO: implement — use freezegun or fakeredis time manipulation
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Key isolation
-# ---------------------------------------------------------------------------
 
 class TestKeyIsolation:
-    """Independent counters for different rate-limit keys."""
 
     @pytest.mark.asyncio
     async def test_different_keys_are_independent(self, rate_limiter, window_config):
-        """
-        Exhausting the limit for key A should not affect key B.
-        """
-        # TODO: implement
-        ...
+        for _ in range(window_config.max_requests):
+            await rate_limiter.check(key="key-x", config=window_config)
 
+        # key-x is exhausted, but key-y should still work
+        await rate_limiter.check(key="key-y", config=window_config)
 
-# ---------------------------------------------------------------------------
-# Peek
-# ---------------------------------------------------------------------------
 
 class TestPeek:
-    """Tests for the non-destructive peek() method."""
 
     @pytest.mark.asyncio
     async def test_peek_returns_correct_remaining(self, rate_limiter, window_config):
-        """
-        After 3 requests, peek() should report remaining = max_requests - 3.
-        """
-        # TODO: implement
-        ...
+        for _ in range(3):
+            await rate_limiter.check(key="peek-user", config=window_config)
+
+        used, remaining, _ = await rate_limiter.peek(key="peek-user", config=window_config)
+        assert used == 3
+        assert remaining == window_config.max_requests - 3
 
     @pytest.mark.asyncio
     async def test_peek_does_not_consume_quota(self, rate_limiter, window_config):
-        """
-        Calling peek() N times should not affect the available quota.
-        """
-        # TODO: implement
-        ...
+        await rate_limiter.check(key="peek-nc", config=window_config)
 
+        for _ in range(10):
+            await rate_limiter.peek(key="peek-nc", config=window_config)
 
-# ---------------------------------------------------------------------------
-# Reset
-# ---------------------------------------------------------------------------
+        used, remaining, _ = await rate_limiter.peek(key="peek-nc", config=window_config)
+        assert used == 1
+        assert remaining == window_config.max_requests - 1
+
 
 class TestReset:
-    """Tests for the reset() method."""
 
     @pytest.mark.asyncio
     async def test_reset_clears_window(self, rate_limiter, window_config):
-        """
-        After exhausting the limit and calling reset(), new requests should
-        be allowed again.
-        """
-        # TODO: implement
-        ...
+        for _ in range(window_config.max_requests):
+            await rate_limiter.check(key="reset-user", config=window_config)
 
+        with pytest.raises(RateLimitExceeded):
+            await rate_limiter.check(key="reset-user", config=window_config)
 
-# ---------------------------------------------------------------------------
-# Concurrency
-# ---------------------------------------------------------------------------
+        await rate_limiter.reset(key="reset-user", config=window_config)
+
+        # Should be allowed again after reset
+        await rate_limiter.check(key="reset-user", config=window_config)
+
 
 class TestConcurrency:
-    """Atomicity tests — verify no race conditions under concurrent load."""
 
     @pytest.mark.asyncio
-    async def test_concurrent_requests_do_not_exceed_limit(
-        self, rate_limiter, window_config
-    ):
-        """
-        Launch max_requests + 5 concurrent check() calls via asyncio.gather.
-        Exactly max_requests should succeed and exactly 5 should raise
-        RateLimitExceeded.
-        """
-        # TODO: implement
-        ...
+    async def test_concurrent_requests_do_not_exceed_limit(self, rate_limiter, window_config):
+        total = window_config.max_requests + 5
+
+        async def attempt():
+            try:
+                await rate_limiter.check(key="concurrent", config=window_config)
+                return True
+            except RateLimitExceeded:
+                return False
+
+        results = await asyncio.gather(*[attempt() for _ in range(total)])
+        successes = sum(1 for r in results if r)
+        failures = sum(1 for r in results if not r)
+
+        assert successes == window_config.max_requests
+        assert failures == 5

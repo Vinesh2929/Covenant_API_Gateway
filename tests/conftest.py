@@ -1,33 +1,36 @@
 """
-tests/conftest.py
+tests/conftest.py — shared pytest fixtures for the entire test suite.
 
-Shared pytest fixtures for the entire test suite.
-
-Fixtures defined here are automatically available to all test modules without
-explicit imports.  Use the narrowest possible scope (function > module > session)
-to keep tests isolated and side-effect free.
-
-Fixtures provided:
-  - settings            — a Settings instance with test-safe defaults
-  - redis_client        — a fakeredis.FakeAsyncRedis instance (no real Redis needed)
-  - rate_limiter        — a RateLimiter wired to the fake Redis
-  - pattern_guard       — a PatternGuard loaded from a minimal test patterns file
-  - ml_guard_stub       — an MLGuard with the model replaced by a stub that returns
-                          a configurable ScanResult
-  - security_guard      — a SecurityGuard using pattern_guard + ml_guard_stub
-  - embedder_stub       — an Embedder whose embed() returns deterministic vectors
-  - faiss_store         — a fresh in-memory FAISSStore (dimension=8 for speed)
-  - semantic_cache      — a SemanticCache using embedder_stub + faiss_store + fake Redis
-  - contract_registry   — a ContractRegistry loaded from tests/fixtures/contracts/
-  - test_client         — FastAPI TestClient wrapping the full app with mocked deps
-  - sample_request      — a minimal valid chat completion request dict
-  - sample_response     — a minimal valid normalised response dict
+Uses fakeredis (in-memory) and mocks so no external services are needed.
 """
 
 from __future__ import annotations
 
+import hashlib
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
 import pytest
-from fastapi.testclient import TestClient
+import pytest_asyncio
+import fakeredis.aioredis
+
+from gateway.config import (
+    CacheSettings,
+    ContractSettings,
+    LangfuseSettings,
+    ProviderSettings,
+    RedisSettings,
+    SecuritySettings,
+    Settings,
+)
+from gateway.rate_limiter import RateLimiter
+from gateway.security.pattern_guard import PatternGuard
+from gateway.security.ml_guard import MLGuard, ScanResult
+from gateway.security.guard import SecurityGuard
+from gateway.cache.store import FAISSStore
+from gateway.cache.semantic_cache import SemanticCache
+from gateway.contracts.registry import ContractRegistry
+from gateway.router import ProviderRouter
 
 
 # ---------------------------------------------------------------------------
@@ -36,43 +39,59 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture(scope="session")
 def settings():
-    """
-    Return a Settings instance configured for testing.
-
-    Uses safe defaults: no real API keys, ML guard disabled, Langfuse disabled,
-    a small rate limit window for fast tests.
-    """
-    # TODO: implement — return Settings(...)
-    ...
+    return Settings(
+        app_name="Test Gateway",
+        app_version="0.0.1-test",
+        environment="test",
+        gateway_api_key="test-key-12345678",
+        redis=RedisSettings(host="localhost", port=6379, password=None),
+        langfuse=LangfuseSettings(enabled=False),
+        providers=ProviderSettings(
+            openai_api_key="sk-test-fake",
+            anthropic_api_key="sk-ant-test-fake",
+        ),
+        security=SecuritySettings(
+            pattern_file_path="gateway/security/patterns.json",
+            pattern_guard_enabled=True,
+            ml_guard_enabled=True,
+            ml_confidence_threshold=0.85,
+        ),
+        cache=CacheSettings(
+            enabled=True,
+            similarity_threshold=0.92,
+            max_cache_entries=100,
+            cache_ttl_seconds=60,
+        ),
+        contracts=ContractSettings(
+            contracts_dir="contracts/",
+            drift_enabled=False,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
-# Redis
+# Redis (fakeredis — fully in-memory)
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def redis_client():
-    """
-    Return a fakeredis.FakeAsyncRedis instance.
-
-    fakeredis implements the full aioredis interface in memory, making tests
-    fast and network-free.
-    """
-    # TODO: implement — import fakeredis.aioredis, yield FakeAsyncRedis()
-    ...
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    yield client
+    await client.aclose()
 
 
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-async def rate_limiter(settings, redis_client):
-    """
-    Return a RateLimiter wired to the fake Redis client.
-    """
-    # TODO: implement
-    ...
+@pytest_asyncio.fixture
+async def rate_limiter(redis_client):
+    limiter = RateLimiter.__new__(RateLimiter)
+    limiter._settings = RedisSettings()
+    limiter._pool = None
+    limiter._client = redis_client
+    limiter._script_sha = await redis_client.script_load(RateLimiter._LUA_SCRIPT)
+    return limiter
 
 
 # ---------------------------------------------------------------------------
@@ -80,85 +99,126 @@ async def rate_limiter(settings, redis_client):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def pattern_guard(settings):
-    """
-    Return a PatternGuard loaded with a small set of test patterns.
-    """
-    # TODO: implement — PatternGuard("tests/fixtures/test_patterns.json")
-    ...
+def pattern_guard():
+    return PatternGuard("gateway/security/patterns.json")
 
 
 @pytest.fixture
 def ml_guard_stub(settings):
-    """
-    Return an MLGuard whose _infer() method is replaced with a configurable stub.
+    guard = MLGuard.__new__(MLGuard)
+    guard._settings = settings.security
+    guard._model = MagicMock()
+    guard._tokenizer = MagicMock()
+    guard._device = "cpu"
+    guard._loaded = True
 
-    Tests can override the stub's return value to simulate injection detections
-    without loading the actual DistilBERT model.
-    """
-    # TODO: implement — patch MLGuard._infer with MagicMock
-    ...
+    async def _stub_scan(text: str) -> ScanResult:
+        import time
+        if "injection" in text.lower() or "ignore previous" in text.lower():
+            return ScanResult(
+                is_injection=True,
+                confidence=0.95,
+                label="INJECTION",
+                latency_ms=1.0,
+                model_version="stub",
+            )
+        return ScanResult(
+            is_injection=False,
+            confidence=0.05,
+            label="SAFE",
+            latency_ms=1.0,
+            model_version="stub",
+        )
+
+    guard.scan = _stub_scan
+    return guard
 
 
 @pytest.fixture
 def security_guard(settings, pattern_guard, ml_guard_stub):
-    """
-    Return a SecurityGuard composed from the pattern_guard fixture and the
-    ml_guard_stub (no real ML model needed).
-    """
-    # TODO: implement
-    ...
+    guard = SecurityGuard.__new__(SecurityGuard)
+    guard._settings = settings.security
+    guard._pattern_guard = pattern_guard
+    guard._ml_guard = ml_guard_stub
+    guard._dry_run = False
+    return guard
 
 
 # ---------------------------------------------------------------------------
-# Cache
+# Cache (stub embedder + in-memory FAISS)
 # ---------------------------------------------------------------------------
+
+EMBED_DIM = 8
+
+
+class StubEmbedder:
+    """Deterministic embedder for testing — hashes text into 8-dim unit vectors."""
+
+    def __init__(self):
+        self._dimension = EMBED_DIM
+
+    @property
+    def dimension(self):
+        return self._dimension
+
+    async def warm_up(self):
+        pass
+
+    async def embed(self, text: str) -> np.ndarray:
+        h = hashlib.sha256(text.encode()).digest()
+        vec = np.frombuffer(h[:EMBED_DIM * 4], dtype=np.float32).copy()
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec /= norm
+        return vec
+
+    async def embed_batch(self, texts: list[str]) -> np.ndarray:
+        vecs = [await self.embed(t) for t in texts]
+        return np.stack(vecs)
+
 
 @pytest.fixture
 def embedder_stub():
-    """
-    Return an Embedder whose embed() returns deterministic 8-dimensional unit
-    vectors derived from the hash of the input text.
-
-    Using 8D instead of 384D keeps FAISS operations fast in tests.
-    """
-    # TODO: implement — mock Embedder with deterministic embed()
-    ...
+    return StubEmbedder()
 
 
 @pytest.fixture
 def faiss_store(settings):
-    """
-    Return a fresh in-memory FAISSStore with dimension=8 (for speed).
-    """
-    # TODO: implement — FAISSStore(settings.cache), call build(8)
-    ...
+    store = FAISSStore(settings.cache)
+    store.build(EMBED_DIM)
+    return store
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def semantic_cache(settings, embedder_stub, faiss_store, redis_client):
-    """
-    Return a SemanticCache with the stub embedder, in-memory FAISS, and
-    fake Redis — no external services required.
-    """
-    # TODO: implement
-    ...
+    cache = SemanticCache.__new__(SemanticCache)
+    cache._settings = settings.cache
+    cache._redis = redis_client
+    cache._embedder = embedder_stub
+    cache._store = faiss_store
+    cache._hits = 0
+    cache._misses = 0
+    return cache
 
 
 # ---------------------------------------------------------------------------
 # Contracts
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def contract_registry():
-    """
-    Return a ContractRegistry loaded from tests/fixtures/contracts/.
+    registry = ContractRegistry(contracts_dir="contracts/")
+    registry.load()
+    return registry
 
-    The fixture directory contains a small set of contracts for each type
-    (keyword, regex, sentiment, schema) used in test_contracts.py.
-    """
-    # TODO: implement — ContractRegistry("tests/fixtures/contracts/"), call load()
-    ...
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def router(settings):
+    return ProviderRouter(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +227,6 @@ def contract_registry():
 
 @pytest.fixture
 def sample_request() -> dict:
-    """
-    Return a minimal valid normalised chat completion request dict.
-    """
     return {
         "model": "gpt-4o-mini",
         "messages": [{"role": "user", "content": "What is 2 + 2?"}],
@@ -180,9 +237,6 @@ def sample_request() -> dict:
 
 @pytest.fixture
 def sample_response() -> dict:
-    """
-    Return a minimal valid normalised chat completion response dict.
-    """
     return {
         "id": "chatcmpl-test-123",
         "object": "chat.completion",
@@ -201,19 +255,3 @@ def sample_response() -> dict:
             "total_tokens": 30,
         },
     }
-
-
-# ---------------------------------------------------------------------------
-# FastAPI test client
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def test_client(settings) -> TestClient:
-    """
-    Return a FastAPI TestClient for the full gateway app with mocked external
-    dependencies injected via FastAPI's dependency_overrides.
-
-    Covers: mocked provider adapters, fake Redis, stub ML model.
-    """
-    # TODO: implement — import app, override dependencies, return TestClient(app)
-    ...

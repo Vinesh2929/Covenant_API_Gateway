@@ -1,183 +1,133 @@
 """
-tests/test_router.py
-
-Unit tests for gateway/router.py — provider routing and model alias resolution.
-
-Test coverage goals:
-  - Known model aliases resolve to the correct (provider, canonical_model) pair.
-  - Unknown aliases raise ValueError or fall back to the default provider.
-  - COST policy selects the cheapest alias when multiple providers match.
-  - LATENCY policy selects the lowest-latency alias.
-  - EXPLICIT policy (X-Provider header) overrides automatic selection.
-  - Fallback logic skips a failed provider and routes to the next candidate.
-  - register_alias() and list_models() behave correctly.
-  - update_latency() affects subsequent LATENCY routing decisions.
+tests/test_router.py — tests for the multi-provider router.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from gateway.router import ModelAlias, ProviderRouter, RoutingPolicy
+from gateway.router import ProviderRouter, RoutingPolicy, ModelAlias, RoutingDecision
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-@pytest.fixture
-def router(settings):
-    """Return a ProviderRouter initialised with test settings."""
-    # TODO: return ProviderRouter(settings)
-    ...
-
-
-@pytest.fixture
-def gpt4_alias() -> ModelAlias:
-    """Return a sample ModelAlias for gpt-4o pointing at OpenAI."""
-    return ModelAlias(
-        alias="gpt-4o",
-        provider_name="openai",
-        canonical_model="gpt-4o-2024-11-20",
-        priority=1,
-        cost_per_1k_tok=0.0025,
-        avg_latency_ms=350.0,
-    )
-
-
-@pytest.fixture
-def claude_alias() -> ModelAlias:
-    """Return a sample ModelAlias for claude-3-5-sonnet pointing at Anthropic."""
-    return ModelAlias(
-        alias="claude-3-5-sonnet",
-        provider_name="anthropic",
-        canonical_model="claude-3-5-sonnet-20241022",
-        priority=2,
-        cost_per_1k_tok=0.003,
-        avg_latency_ms=420.0,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Alias resolution
-# ---------------------------------------------------------------------------
 
 class TestAliasResolution:
-    """Tests for ProviderRouter.resolve()."""
 
-    def test_known_alias_resolves_to_correct_provider(self, router, gpt4_alias):
-        """
-        Given a request with model="gpt-4o", resolve() should return a
-        RoutingDecision with provider_name="openai".
-        """
-        # TODO: implement
-        ...
+    def test_openai_model_resolves_to_openai(self, router):
+        decision = router.resolve({"model": "gpt-4o-mini"})
+        assert decision.provider_name == "openai"
+        assert decision.canonical_model == "gpt-4o-mini"
 
-    def test_unknown_alias_raises_value_error(self, router):
-        """
-        Given a model alias that is not in the registry and no default provider,
-        resolve() should raise ValueError.
-        """
-        # TODO: implement
-        ...
+    def test_anthropic_model_resolves_to_anthropic(self, router):
+        decision = router.resolve({"model": "claude-3-5-sonnet"})
+        assert decision.provider_name == "anthropic"
+        assert "claude" in decision.canonical_model.lower()
 
-    def test_unknown_alias_falls_back_to_default_provider(self, router, settings):
-        """
-        When settings.providers.default_provider is set, an unknown alias should
-        route to the default provider instead of raising an error.
-        """
-        # TODO: implement
-        ...
+    def test_local_model_resolves_to_local(self, router):
+        decision = router.resolve({"model": "llama3"})
+        assert decision.provider_name == "local"
 
-    def test_resolve_returns_correct_adapter_class(self, router, gpt4_alias):
-        """
-        The RoutingDecision.adapter_class should be OpenAIAdapter for OpenAI aliases.
-        """
-        # TODO: implement
-        ...
+    def test_unknown_model_falls_back_to_default_provider(self, router):
+        decision = router.resolve({"model": "nonexistent-model-xyz"})
+        assert isinstance(decision, RoutingDecision)
+        assert decision.canonical_model == "nonexistent-model-xyz"
 
-
-# ---------------------------------------------------------------------------
-# Routing policies
-# ---------------------------------------------------------------------------
 
 class TestRoutingPolicies:
-    """Tests for the COST, LATENCY, and EXPLICIT routing policies."""
 
-    def test_cost_policy_selects_cheaper_provider(self, router):
-        """
-        Register two aliases for the same model string with different costs.
-        COST policy should select the one with lower cost_per_1k_tok.
-        """
-        # TODO: implement
-        ...
+    def test_cost_policy_selects_cheapest(self, settings):
+        router = ProviderRouter(settings)
+        router._policy = RoutingPolicy.COST
 
-    def test_latency_policy_selects_faster_provider(self, router):
-        """
-        Register two aliases with different avg_latency_ms.
-        LATENCY policy should select the lower-latency one.
-        """
-        # TODO: implement
-        ...
+        cheap = ModelAlias("test-model", "openai", "cheap", cost_per_1k_tok=0.001)
+        expensive = ModelAlias("test-model", "anthropic", "expensive", cost_per_1k_tok=0.1)
 
-    def test_explicit_policy_respects_x_provider_header(self, router):
-        """
-        When X-Provider: anthropic is in the request, resolve() should use
-        Anthropic regardless of the cost/latency policy.
-        """
-        # TODO: implement
-        ...
+        selected = router._apply_policy([cheap, expensive], RoutingPolicy.COST)
+        assert selected.canonical_model == "cheap"
+
+    def test_latency_policy_selects_fastest(self, settings):
+        router = ProviderRouter(settings)
+
+        slow = ModelAlias("m", "openai", "slow", avg_latency_ms=500.0)
+        fast = ModelAlias("m", "anthropic", "fast", avg_latency_ms=50.0)
+
+        selected = router._apply_policy([slow, fast], RoutingPolicy.LATENCY)
+        assert selected.canonical_model == "fast"
+
+    def test_latency_policy_deprioritises_unmeasured(self, settings):
+        router = ProviderRouter(settings)
+
+        measured = ModelAlias("m", "openai", "measured", avg_latency_ms=200.0)
+        unmeasured = ModelAlias("m", "anthropic", "unmeasured", avg_latency_ms=0.0)
+
+        selected = router._apply_policy([measured, unmeasured], RoutingPolicy.LATENCY)
+        assert selected.canonical_model == "measured"
 
 
-# ---------------------------------------------------------------------------
-# Fallback
-# ---------------------------------------------------------------------------
+class TestExplicitProvider:
+
+    def test_x_provider_header_overrides_policy(self, router):
+        decision = router.resolve({
+            "model": "gpt-4o-mini",
+            "x_provider": "openai",
+        })
+        assert decision.provider_name == "openai"
+
 
 class TestFallback:
-    """Tests for the provider fallback mechanism."""
 
-    def test_fallback_skips_unavailable_provider(self, router):
-        """
-        Mark primary provider as unavailable; verify resolve() returns an
-        alternative provider.
-        """
-        # TODO: implement
-        ...
+    def test_fallback_returns_alternative(self, settings):
+        router = ProviderRouter(settings)
+        router.register_alias(
+            ModelAlias("multi", "openai", "multi-oai", priority=0)
+        )
+        router.register_alias(
+            ModelAlias("multi", "anthropic", "multi-ant", priority=1)
+        )
 
-    def test_no_fallback_raises_when_all_providers_unavailable(self, router):
-        """
-        When no providers are available for an alias, resolve() should raise.
-        """
-        # TODO: implement
-        ...
+        alt = router._fallback("openai", "multi")
+        assert alt is not None
+        assert alt.provider_name == "anthropic"
+
+    def test_fallback_returns_none_when_no_alternative(self, router):
+        alt = router._fallback("openai", "gpt-4o-mini")
+        assert alt is None
 
 
-# ---------------------------------------------------------------------------
-# Registry management
-# ---------------------------------------------------------------------------
+class TestRegisterAlias:
 
-class TestRegistryManagement:
-    """Tests for register_alias() and list_models()."""
+    def test_register_and_resolve(self, router):
+        router.register_alias(
+            ModelAlias("my-custom-model", "openai", "gpt-4o", cost_per_1k_tok=0.005)
+        )
+        decision = router.resolve({"model": "my-custom-model"})
+        assert decision.provider_name == "openai"
+        assert decision.canonical_model == "gpt-4o"
 
-    def test_register_alias_adds_to_registry(self, router, gpt4_alias):
-        """register_alias() should make the alias resolvable."""
-        # TODO: implement
-        ...
 
-    def test_register_alias_overwrites_existing(self, router, gpt4_alias):
-        """Registering an alias with the same alias string should replace it."""
-        # TODO: implement
-        ...
+class TestListModels:
 
-    def test_list_models_returns_all_aliases(self, router, gpt4_alias, claude_alias):
-        """list_models() should include every registered alias."""
-        # TODO: implement
-        ...
+    def test_list_models_returns_entries(self, router):
+        models = router.list_models()
+        assert len(models) > 0
+        assert all("id" in m and "owned_by" in m for m in models)
 
-    def test_update_latency_affects_routing(self, router):
-        """
-        After update_latency() raises the latency of one provider, the LATENCY
-        policy should prefer the other.
-        """
-        # TODO: implement
-        ...
+    def test_list_models_contains_gpt4o(self, router):
+        models = router.list_models()
+        ids = [m["id"] for m in models]
+        assert "gpt-4o" in ids
+
+
+class TestLatencyUpdate:
+
+    def test_update_latency_first_measurement(self, router):
+        router.update_latency("openai", "gpt-4o-mini", 100.0)
+        candidates = router._aliases["gpt-4o-mini"]
+        oai = [c for c in candidates if c.provider_name == "openai"][0]
+        assert oai.avg_latency_ms == 100.0
+
+    def test_update_latency_ema(self, router):
+        router.update_latency("openai", "gpt-4o-mini", 100.0)
+        router.update_latency("openai", "gpt-4o-mini", 200.0)
+        candidates = router._aliases["gpt-4o-mini"]
+        oai = [c for c in candidates if c.provider_name == "openai"][0]
+        # EMA: 0.2 * 200 + 0.8 * 100 = 120
+        assert abs(oai.avg_latency_ms - 120.0) < 0.01
