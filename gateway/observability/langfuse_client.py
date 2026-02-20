@@ -33,6 +33,7 @@ Key classes / functions:
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
@@ -89,19 +90,54 @@ class GatewayTrace:
         self._trace = None  # langfuse.Trace, set in __aenter__
 
     async def __aenter__(self) -> "GatewayTrace":
-        """Start the Langfuse trace."""
-        # TODO: implement — self._trace = self._client._langfuse.trace(...)
+        """
+        Start the Langfuse trace.
+
+        When Langfuse is enabled, creates a trace tagged with the request ID
+        and app ID so all child spans are grouped in the Langfuse UI.
+
+        When disabled (self._client._langfuse is None), this is a no-op — the
+        rest of the code can still call span() and record_generation() safely.
+        """
+        lf = self._client._langfuse
+        if lf is not None:
+            # lf.trace() registers the trace with Langfuse.
+            # - name: displayed in the Langfuse UI as the trace label
+            # - user_id: the app_id helps group traces by application
+            # - id: the request_id makes traces searchable by request
+            # - metadata: any extra context (model, provider, etc.)
+            self._trace = lf.trace(
+                name="gateway-request",
+                user_id=self._app_id,
+                id=self._request_id,
+                metadata=self._metadata,
+            )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """End the trace, marking it as errored if an exception occurred."""
-        # TODO: implement — set trace status, call self._trace.update(...)
-        ...
+        """
+        End the trace, marking it as errored if an exception occurred.
+
+        Langfuse traces don't have an explicit "end" call — they're
+        finalised when all spans complete.  We use update() to attach
+        error context when the request fails.
+        """
+        if self._trace is not None and exc_type is not None:
+            # An unhandled exception escaped the `async with` block.
+            # Attach error metadata so the trace is marked failed in Langfuse.
+            self._trace.update(
+                status_message=f"{exc_type.__name__}: {exc_val}",
+                level="ERROR",
+            )
+        # Returning None (falsy) does NOT suppress the exception.
 
     @asynccontextmanager
     async def span(self, name: str, **metadata: Any) -> AsyncIterator[None]:
         """
         Create a child span for a named pipeline stage.
+
+        The span automatically records its start and end time, so latency
+        for each pipeline stage appears in the Langfuse trace waterfall view.
 
         Args:
             name:     Human-readable span name (e.g. "rate_limit_check").
@@ -109,9 +145,30 @@ class GatewayTrace:
 
         Yields:
             None (the span is ended automatically on exit).
+
+        Usage::
+
+            async with trace.span("security_scan", model="gpt-4o"):
+                result = await guard.scan(prompt)
         """
-        # TODO: implement — create span, yield, end span in finally block
-        ...
+        if self._trace is None:
+            # Tracing disabled — yield immediately without creating a span.
+            yield
+            return
+
+        # Create child span on the trace.  Langfuse records the start time
+        # automatically when span() is called.
+        span = self._trace.span(
+            name=name,
+            metadata=metadata if metadata else None,
+        )
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            # Always end the span, even if the body raised an exception.
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            span.end(metadata={"latency_ms": elapsed_ms})
 
     def record_generation(
         self,
@@ -132,28 +189,65 @@ class GatewayTrace:
             completion_tokens: Tokens in the generated response.
             cost_usd:          Optional estimated cost in USD.
         """
-        # TODO: implement — self._trace.generation(...)
-        ...
+        if self._trace is None:
+            return
+
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+        # generation() creates a Langfuse Generation object — a specialised
+        # span for LLM calls that also tracks token counts and estimated cost.
+        kwargs: dict[str, Any] = {
+            "name": "llm-call",
+            "model": model,
+            "usage": usage,
+        }
+        if cost_usd is not None:
+            kwargs["metadata"] = {"cost_usd": cost_usd}
+
+        self._trace.generation(**kwargs)
 
     def set_output(self, response: dict) -> None:
         """
         Attach the final normalised response as the trace output.
 
+        The output appears in the Langfuse UI alongside the trace, making it
+        easy to inspect what the model returned for a given request.
+
         Args:
             response: The normalised response dict returned to the client.
         """
-        # TODO: implement — self._trace.update(output=response)
-        ...
+        if self._trace is None:
+            return
+
+        # Extract the assistant message content from the normalised response.
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            content = str(response)
+
+        self._trace.update(output=content)
 
     def set_error(self, error: Exception) -> None:
         """
         Mark the trace as failed and attach error details.
 
+        Called explicitly when we catch a known error (e.g. ProviderUnavailableError)
+        and want to record it without letting the exception propagate to __aexit__.
+
         Args:
             error: The exception that caused the request to fail.
         """
-        # TODO: implement
-        ...
+        if self._trace is None:
+            return
+
+        self._trace.update(
+            status_message=f"{type(error).__name__}: {error}",
+            level="ERROR",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -176,12 +270,34 @@ class LangfuseClient:
         If enabled=False or the keys are missing, self._langfuse is set to None
         and all subsequent calls are no-ops.
 
+        The langfuse import is deferred here so the gateway can start without
+        the langfuse package installed if tracing is disabled.
+
         Args:
             settings: LangfuseSettings with public_key, secret_key, host.
         """
         self._settings = settings
         self._langfuse = None  # langfuse.Langfuse instance, or None if disabled
-        # TODO: implement — if settings.enabled: import langfuse; self._langfuse = Langfuse(...)
+
+        if settings.enabled and settings.public_key and settings.secret_key:
+            # Deferred import — only load the Langfuse SDK when actually needed.
+            # This prevents an ImportError from crashing the gateway when
+            # langfuse is not installed in development.
+            try:
+                from langfuse import Langfuse  # type: ignore[import]
+
+                self._langfuse = Langfuse(
+                    public_key=settings.public_key,
+                    secret_key=settings.secret_key,
+                    host=settings.host,
+                    # flush_interval: how often background thread sends events.
+                    # Lower = more timely traces; higher = fewer API calls.
+                    flush_interval=getattr(settings, "flush_interval", 0.5),
+                )
+            except ImportError:
+                # Graceful degradation: if langfuse is not installed, tracing
+                # simply does nothing.  The gateway continues to serve requests.
+                pass
 
     def create_trace(
         self,
@@ -200,14 +316,22 @@ class LangfuseClient:
         Returns:
             A GatewayTrace instance ready to be used as an async context manager.
         """
-        # TODO: implement
-        ...
+        # Always return a GatewayTrace — when self._langfuse is None, all
+        # GatewayTrace methods are no-ops, so callers never need to check.
+        return GatewayTrace(
+            client=self,
+            request_id=request_id,
+            app_id=app_id,
+            metadata=metadata,
+        )
 
     def flush(self) -> None:
         """
         Block until all pending Langfuse events have been sent.
 
-        Called during FastAPI shutdown to prevent trace loss.
+        Called during FastAPI shutdown to prevent trace loss.  Without this,
+        the Langfuse background thread may not have flushed its queue before
+        the process exits.
         """
-        # TODO: implement — self._langfuse.flush() if self._langfuse
-        ...
+        if self._langfuse is not None:
+            self._langfuse.flush()

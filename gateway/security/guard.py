@@ -69,13 +69,25 @@ class SecurityGuard:
     """
     Two-tier injection detection orchestrator.
 
-    Tier 1 (PatternGuard) always runs first because it is extremely fast.
-    Tier 2 (MLGuard) runs only when:
-      a) Tier 1 found nothing, OR
-      b) Tier 1 found a LOW/MEDIUM severity match (and we want ML confirmation).
+    DESIGN RATIONALE — WHY TWO TIERS?
 
-    This design keeps the common case (clean prompt) at < 2 ms end-to-end
-    while still catching sophisticated injections that evade simple patterns.
+    Tier 1 (PatternGuard) is a regex scanner:
+      + Extremely fast: < 1 ms per prompt
+      + Zero false positives on explicitly-listed patterns
+      + No GPU or model loading required
+      - Can only catch known patterns; creative attackers evade it
+
+    Tier 2 (MLGuard) is a DistilBERT classifier:
+      + Generalises to paraphrased, novel, or obfuscated injections
+      + Learns statistical patterns across thousands of training examples
+      - Slower: 30-100 ms on CPU
+      - Requires a trained model on disk
+
+    The two-tier pipeline gets the best of both:
+      - Common, obvious injections are caught instantly by Tier 1.
+      - Sophisticated attacks that evade Tier 1 are caught by Tier 2.
+      - Clean prompts pay only the Tier 1 cost (< 1 ms), then Tier 2 (30-100 ms).
+      - HIGH/CRITICAL pattern matches skip Tier 2 entirely (already blocking).
 
     Usage::
 
@@ -87,68 +99,170 @@ class SecurityGuard:
             raise HTTPException(400, detail=result.reason)
     """
 
-    # Pattern severity levels at or above this value trigger an immediate block
-    # without waiting for the ML model.
-    _IMMEDIATE_BLOCK_SEVERITY = PatternSeverity.HIGH
+    # Pattern severities that cause an immediate block WITHOUT waiting for ML.
+    # HIGH and CRITICAL patterns are high-confidence matches — running the ML
+    # model for a "second opinion" would just add latency with no benefit.
+    _IMMEDIATE_BLOCK_SEVERITIES = {PatternSeverity.HIGH, PatternSeverity.CRITICAL}
 
     def __init__(self, settings: SecuritySettings) -> None:
         """
-        Initialise both guard tiers.
+        Initialise both guard tiers from settings.
 
         Args:
             settings: SecuritySettings containing paths, thresholds, and
                       enabled flags for both tiers.
         """
         self._settings = settings
+
+        # Tier 1: created immediately (regex compilation is cheap).
+        # If pattern_guard_enabled=False, we still create the object but
+        # skip calling .scan() on it in scan().
         self._pattern_guard = PatternGuard(settings.pattern_file_path)
+
+        # Tier 2: created but NOT loaded yet.  warm_up() loads the model.
         self._ml_guard = MLGuard(settings)
-        self._dry_run: bool = False  # set via environment / admin API
+
+        # Dry-run mode: detect and log injections but never block.
+        # Useful when deploying the security guard to a new environment and
+        # you want to observe what it would block before enabling enforcement.
+        self._dry_run: bool = False
 
     async def warm_up(self) -> None:
         """
         Warm up the ML model by delegating to MLGuard.warm_up().
 
-        Should be called from the FastAPI lifespan startup hook.  Safe to call
-        multiple times (the underlying load is idempotent).
+        Idempotent — safe to call multiple times.  Each extra call after the
+        first is a no-op because MLGuard tracks whether loading was attempted.
+
+        Called from the FastAPI lifespan startup hook.
         """
-        # TODO: delegate to self._ml_guard.warm_up() if ml_guard_enabled
-        ...
+        if self._settings.ml_guard_enabled:
+            await self._ml_guard.warm_up()
 
     async def scan(self, text: str) -> GuardResult:
         """
-        Run the full two-tier injection scan pipeline.
+        Run the full two-tier injection scan and return a unified result.
 
-        Pipeline:
-          1. Run PatternGuard.scan() (always, unless pattern_guard_enabled=False).
-          2. If a HIGH/CRITICAL pattern fires → block immediately.
-          3. Else if ML guard is enabled → run MLGuard.scan().
-          4. Merge results into a GuardResult.
-          5. If dry_run mode is on → set blocked=False regardless of findings.
+        Pipeline (left to right, earliest exit wins):
+
+          [Tier 1: pattern scan]
+                │
+                ├── Pattern severity HIGH/CRITICAL?  → BLOCK immediately (skip ML)
+                │
+                ├── Pattern severity LOW/MEDIUM?  → run ML for second opinion
+                │       └── ML says injection?   → BLOCK (tier=2)
+                │           ML says benign?      → PASS (low-severity pattern logged)
+                │
+                └── No pattern match?  → run ML
+                        └── ML says injection? → BLOCK (tier=2)
+                            ML says benign?    → PASS (clean prompt)
+
+        Dry-run mode:
+          In dry_run mode the pipeline runs fully but blocked is forced to False.
+          This lets operators evaluate what the guard WOULD block in production
+          before enabling enforcement.
 
         Args:
-            text: The prompt string to analyse.
+            text: Full conversation as a single string.
 
         Returns:
-            GuardResult with the combined decision and all intermediate data.
+            GuardResult with blocked flag, reason, tier info, and raw sub-results.
         """
-        # TODO: implement
-        ...
+        import time
+        t0 = time.perf_counter()
+
+        pattern_match: Optional[PatternMatch] = None
+        ml_result: Optional[ScanResult] = None
+        blocked = False
+        reason = ""
+        tier_triggered: Optional[int] = None
+
+        # ---------------------------------------------------------------
+        # Tier 1: Pattern scan
+        # ---------------------------------------------------------------
+        if self._settings.pattern_guard_enabled:
+            pattern_match = self._pattern_guard.scan(text)
+
+            if pattern_match is not None:
+                severity = pattern_match.severity
+
+                if severity in self._IMMEDIATE_BLOCK_SEVERITIES:
+                    # High confidence match — block without calling the ML model.
+                    blocked = True
+                    tier_triggered = 1
+                    reason = (
+                        f"Prompt injection detected by pattern guard "
+                        f"(pattern: '{pattern_match.pattern_id}', "
+                        f"severity: {severity.value})"
+                    )
+                # For LOW/MEDIUM severity we fall through to Tier 2 below.
+
+        # ---------------------------------------------------------------
+        # Tier 2: ML scan (only if not already blocking from Tier 1)
+        # ---------------------------------------------------------------
+        if not blocked and self._should_run_ml(pattern_match):
+            ml_result = await self._ml_guard.scan(text)
+
+            if ml_result.is_injection:
+                blocked = True
+                tier_triggered = 2
+                reason = (
+                    f"Prompt injection detected by ML classifier "
+                    f"(confidence: {ml_result.confidence:.2%}, "
+                    f"threshold: {self._settings.ml_confidence_threshold:.2%})"
+                )
+
+            # Edge case: LOW/MEDIUM pattern matched but ML says benign.
+            # We trust the ML model here and pass the request through.
+            # The pattern match is still logged via the returned GuardResult.
+
+        # ---------------------------------------------------------------
+        # Dry-run override
+        # ---------------------------------------------------------------
+        if self._dry_run and blocked:
+            # We detected an injection but won't block in dry-run mode.
+            # The GuardResult still carries all the detection info for logging.
+            reason = f"[DRY RUN — would have blocked] {reason}"
+            blocked = False
+
+        total_ms = (time.perf_counter() - t0) * 1000
+
+        return GuardResult(
+            blocked=blocked,
+            reason=reason,
+            tier_triggered=tier_triggered,
+            pattern_match=pattern_match,
+            ml_result=ml_result,
+            total_latency_ms=total_ms,
+        )
 
     def _should_run_ml(self, pattern_match: Optional[PatternMatch]) -> bool:
         """
-        Decide whether Tier 2 ML inference is needed given Tier 1's output.
+        Decide whether Tier 2 ML inference is needed.
 
-        Logic:
-          - If pattern_guard_enabled is False → always run ML (if enabled).
-          - If no pattern match → run ML.
-          - If pattern severity is LOW or MEDIUM → run ML for second opinion.
-          - If pattern severity is HIGH or CRITICAL → skip ML (already blocking).
+        The ML guard is skipped if:
+          a) ml_guard_enabled is False in settings.
+          b) Tier 1 found a HIGH/CRITICAL pattern (we're already blocking,
+             no point paying the ML inference cost).
+
+        The ML guard runs if:
+          a) No pattern matched at all (most common case for clean prompts).
+          b) Tier 1 found a LOW/MEDIUM pattern (ML confirms or overrides).
 
         Args:
-            pattern_match: The result from PatternGuard.scan(), or None.
+            pattern_match: Output of PatternGuard.scan(), or None if
+                           pattern_guard_enabled is False.
 
         Returns:
             True if MLGuard.scan() should be invoked.
         """
-        # TODO: implement
-        ...
+        if not self._settings.ml_guard_enabled:
+            return False
+
+        if pattern_match is None:
+            # No pattern matched — ML is our only safety net.
+            return True
+
+        # Pattern matched — run ML only for LOW/MEDIUM severity (not conclusive
+        # enough to block without a second opinion).
+        return pattern_match.severity not in self._IMMEDIATE_BLOCK_SEVERITIES

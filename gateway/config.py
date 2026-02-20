@@ -182,7 +182,22 @@ def get_settings() -> Settings:
         def endpoint(settings: Settings = Depends(get_settings)):
             ...
 
-    The lru_cache ensures that .env is parsed exactly once per process.
+    Why lru_cache(maxsize=1)?
+      Pydantic-Settings reads and validates ALL environment variables every time
+      you call Settings().  That involves disk I/O (.env file), environment
+      lookups, and Pydantic validation.  By caching the result we pay this cost
+      exactly once at startup, and every subsequent call returns the same
+      already-constructed Settings object in microseconds.
+
+      maxsize=1 means "cache exactly one call" — since there are no arguments,
+      the first call's result is returned for every subsequent call.
+
+    In tests, clear the cache between test cases with:
+        get_settings.cache_clear()
     """
-    # TODO: implement (just return Settings())
-    ...
+    # Settings() triggers Pydantic-Settings to:
+    #   1. Read the .env file (if it exists)
+    #   2. Read matching environment variables (env vars override .env file)
+    #   3. Validate every field (wrong type → ValidationError with a clear message)
+    #   4. Return the fully-populated Settings instance
+    return Settings()

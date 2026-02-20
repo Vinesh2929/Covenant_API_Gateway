@@ -29,6 +29,7 @@ Key classes / functions:
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from gateway.config import ProviderSettings
@@ -41,6 +42,24 @@ from gateway.providers.base import (
 
 # Anthropic API version pinned here — bump when adopting new API features.
 ANTHROPIC_API_VERSION = "2023-06-01"
+
+# Default max_tokens when the client request does not specify one.
+# Anthropic requires max_tokens; OpenAI treats it as optional.
+_DEFAULT_MAX_TOKENS = 1024
+
+# OpenAI-only fields that have no equivalent in the Anthropic API.
+_OPENAI_ONLY_FIELDS = frozenset({
+    "n", "logprobs", "top_logprobs", "presence_penalty",
+    "frequency_penalty", "best_of", "logit_bias",
+    "app_id", "x_provider", "x_request_id",
+})
+
+# Mapping from Anthropic stop reasons to OpenAI finish reasons.
+_STOP_REASON_MAP = {
+    "end_turn": "stop",
+    "max_tokens": "length",
+    "stop_sequence": "stop",
+}
 
 
 class AnthropicAdapter(BaseProviderAdapter):
@@ -84,10 +103,9 @@ class AnthropicAdapter(BaseProviderAdapter):
         Forward a normalised chat completion request to the Anthropic API.
 
         Steps:
-          1. Extract the system message via _extract_system().
-          2. Translate the normalised request to Anthropic Messages format.
-          3. POST to {base_url}/v1/messages with retry logic.
-          4. Translate the Anthropic response back to the normalised format.
+          1. Translate the normalised request to Anthropic Messages format.
+          2. POST to {base_url}/v1/messages with retry logic.
+          3. Translate the Anthropic response back to the normalised format.
 
         Args:
             request: Normalised chat completion request dict (OpenAI schema).
@@ -95,18 +113,32 @@ class AnthropicAdapter(BaseProviderAdapter):
         Returns:
             Normalised response dict (OpenAI schema).
         """
-        # TODO: implement
-        ...
+        # The Anthropic base_url is typically "https://api.anthropic.com".
+        # The endpoint is /v1/messages (not /v1/chat/completions).
+        url = f"{self._base_url}/v1/messages"
+        provider_body = self._translate_request(request)
+        headers = self._build_headers()
+
+        raw_response = await self._request_with_retry(url, provider_body, headers)
+
+        return self._translate_response(raw_response)
 
     def _build_headers(self) -> dict[str, str]:
         """
         Build Anthropic-required authentication and version headers.
 
+        Anthropic uses x-api-key instead of the Authorization: Bearer pattern.
+        The anthropic-version header pins the API behaviour — omitting it or
+        sending an old version may cause unexpected response formats.
+
         Returns:
             Dict containing x-api-key, anthropic-version, and Content-Type.
         """
-        # TODO: implement
-        ...
+        return {
+            "x-api-key": self._api_key,
+            "anthropic-version": self._API_VERSION,
+            "Content-Type": "application/json",
+        }
 
     def _translate_request(self, normalised: dict) -> dict:
         """
@@ -125,18 +157,50 @@ class AnthropicAdapter(BaseProviderAdapter):
         Returns:
             Anthropic Messages API request body dict.
         """
-        # TODO: implement
-        ...
+        messages = normalised.get("messages", [])
+
+        # Extract system message and remaining conversation messages.
+        system_text, remaining_messages = self._extract_system(messages)
+
+        body: dict = {
+            "model": normalised["model"],
+            "messages": remaining_messages,
+            # max_tokens is required by Anthropic; default if omitted.
+            "max_tokens": normalised.get("max_tokens", _DEFAULT_MAX_TOKENS),
+        }
+
+        # Only include optional fields if they were provided in the request.
+        if system_text:
+            body["system"] = system_text
+
+        if "temperature" in normalised:
+            body["temperature"] = normalised["temperature"]
+
+        if "top_p" in normalised:
+            body["top_p"] = normalised["top_p"]
+
+        # OpenAI uses "stop" as a string or list; Anthropic uses "stop_sequences" (list).
+        stop = normalised.get("stop")
+        if stop:
+            body["stop_sequences"] = [stop] if isinstance(stop, str) else stop
+
+        return body
 
     def _translate_response(self, provider_response: dict) -> dict:
         """
         Convert an Anthropic Messages response to the normalised OpenAI format.
 
-        Transformation rules:
-          - Concatenate all text blocks in "content" into a single string.
-          - Wrap in choices[0].message.content structure.
-          - Map "stop_reason" using _map_stop_reason().
-          - Rename "input_tokens" → "prompt_tokens", "output_tokens" → "completion_tokens".
+        Anthropic response shape::
+
+            {
+              "id": "msg_...",
+              "type": "message",
+              "role": "assistant",
+              "content": [{"type": "text", "text": "Hello!"}],
+              "model": "claude-3-5-sonnet-20241022",
+              "stop_reason": "end_turn",
+              "usage": {"input_tokens": 10, "output_tokens": 20}
+            }
 
         Args:
             provider_response: Raw Anthropic API response dict.
@@ -144,12 +208,51 @@ class AnthropicAdapter(BaseProviderAdapter):
         Returns:
             Normalised OpenAI-schema response dict.
         """
-        # TODO: implement
-        ...
+        # Concatenate all text content blocks into a single string.
+        # Anthropic returns content as a list of typed blocks; we flatten them.
+        content_blocks = provider_response.get("content", [])
+        content_text = "".join(
+            block.get("text", "")
+            for block in content_blocks
+            if block.get("type") == "text"
+        )
+
+        usage_raw = provider_response.get("usage", {})
+        # Anthropic uses input_tokens / output_tokens; we normalise to OpenAI names.
+        prompt_tokens = usage_raw.get("input_tokens", 0)
+        completion_tokens = usage_raw.get("output_tokens", 0)
+
+        return {
+            "id": provider_response.get("id", ""),
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": provider_response.get("model", ""),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content_text,
+                    },
+                    "finish_reason": self._map_stop_reason(
+                        provider_response.get("stop_reason")
+                    ),
+                }
+            ],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            },
+        }
 
     def _extract_system(self, messages: list[dict]) -> tuple[Optional[str], list[dict]]:
         """
         Separate the system message from the messages list.
+
+        Anthropic requires the system prompt as a top-level field, not as a
+        message with role="system".  This method splits the messages list into
+        the system text and the remaining conversation.
 
         Args:
             messages: Full list of message dicts from the normalised request.
@@ -157,18 +260,38 @@ class AnthropicAdapter(BaseProviderAdapter):
         Returns:
             A 2-tuple: (system_text_or_None, remaining_messages_without_system).
         """
-        # TODO: implement — filter messages where role == "system"
-        ...
+        system_parts: list[str] = []
+        remaining: list[dict] = []
+
+        for msg in messages:
+            if msg.get("role") == "system":
+                # Multiple system messages are concatenated with a newline.
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Multi-part content blocks — extract text parts.
+                    text = " ".join(
+                        part.get("text", "")
+                        for part in content
+                        if part.get("type") == "text"
+                    )
+                    system_parts.append(text)
+                else:
+                    system_parts.append(str(content))
+            else:
+                remaining.append(msg)
+
+        system_text = "\n".join(system_parts) if system_parts else None
+        return system_text, remaining
 
     def _map_stop_reason(self, anthropic_stop_reason: Optional[str]) -> str:
         """
         Map an Anthropic stop reason to the OpenAI-compatible finish reason.
 
         Anthropic → OpenAI mapping:
-          "end_turn"   → "stop"
-          "max_tokens" → "length"
+          "end_turn"      → "stop"
+          "max_tokens"    → "length"
           "stop_sequence" → "stop"
-          None         → "stop"
+          None            → "stop"
 
         Args:
             anthropic_stop_reason: The stop_reason string from the Anthropic response.
@@ -176,5 +299,4 @@ class AnthropicAdapter(BaseProviderAdapter):
         Returns:
             An OpenAI-compatible finish_reason string.
         """
-        # TODO: implement
-        ...
+        return _STOP_REASON_MAP.get(anthropic_stop_reason or "", "stop")

@@ -161,11 +161,23 @@ class BaseProviderAdapter(ABC):
         """
         Return a shared async HTTP client, creating it on first call.
 
+        We share one client across all requests to benefit from connection
+        pooling — httpx keeps keep-alive connections open so subsequent
+        requests to the same host avoid TCP handshake overhead.
+
         Returns:
             An httpx.AsyncClient configured with the adapter's timeout.
         """
-        # TODO: implement — lazy init self._client
-        ...
+        if self._client is None:
+            # httpx.Timeout splits the timeout into connect, read, write, pool.
+            # Passing a single float sets all four to the same value.
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self._timeout),
+                # http2=True speeds up multiplexed requests to providers that
+                # support HTTP/2 (Anthropic, OpenAI both do).
+                http2=True,
+            )
+        return self._client
 
     @abstractmethod
     async def complete(self, request: dict) -> dict:
@@ -238,6 +250,10 @@ class BaseProviderAdapter(ABC):
         Retries up to self.max_retries times on 5xx responses.  Does NOT retry
         on 4xx errors (including 429 — let the caller decide on retry logic).
 
+        Exponential backoff formula:
+            delay = retry_base_delay * (2 ** attempt)
+            attempt 0 → 1s, attempt 1 → 2s, attempt 2 → 4s
+
         Args:
             url:     Full URL including path.
             body:    Request body dict (will be JSON-serialised).
@@ -251,12 +267,68 @@ class BaseProviderAdapter(ABC):
             ProviderUnavailableError: On HTTP 5xx after max_retries exhausted.
             ProviderError:            On other HTTP error codes.
         """
-        # TODO: implement — loop with asyncio.sleep(delay * 2**attempt) backoff
-        ...
+        client = await self._get_client()
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.max_retries):
+            try:
+                response = await client.post(url, json=body, headers=headers)
+            except httpx.TimeoutException as exc:
+                # Network-level timeout — treat like a 503, eligible for retry.
+                last_error = ProviderUnavailableError(
+                    self.provider_name, 503, f"Request timeout: {exc}"
+                )
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                continue
+
+            # --- Success path ---
+            if response.status_code == 200:
+                return response.json()
+
+            # --- Error paths ---
+            # Try to parse the error body; fall back to raw text.
+            try:
+                error_body = response.json()
+            except Exception:
+                error_body = {"error": {"message": response.text}}
+
+            if response.status_code == 429:
+                # Rate limited by the upstream provider.
+                # Extract Retry-After if present.
+                retry_after_header = response.headers.get("retry-after")
+                retry_after = float(retry_after_header) if retry_after_header else None
+                raise RateLimitError(self.provider_name, retry_after)
+
+            if response.status_code >= 500:
+                # Transient server error — eligible for retry with backoff.
+                last_error = ProviderUnavailableError(
+                    self.provider_name,
+                    response.status_code,
+                    str(error_body.get("error", {}).get("message", "Server error")),
+                )
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                continue
+
+            # 4xx (not 429) — client error, do not retry.
+            msg = str(error_body.get("error", {}).get("message", "Unknown error"))
+            raise ProviderError(self.provider_name, response.status_code, msg)
+
+        # All retries exhausted for 5xx errors.
+        raise last_error or ProviderUnavailableError(
+            self.provider_name, 503, "All retry attempts exhausted"
+        )
 
     def extract_usage(self, normalised_response: dict) -> TokenUsage:
         """
         Extract token usage from a normalised response dict.
+
+        The normalised format always has a "usage" key (guaranteed by
+        _translate_response() in each adapter).  This helper exists so
+        main.py doesn't need to know the dict structure.
 
         Args:
             normalised_response: A response dict in OpenAI schema format.
@@ -264,14 +336,23 @@ class BaseProviderAdapter(ABC):
         Returns:
             A TokenUsage dataclass with prompt, completion, and total token counts.
         """
-        # TODO: implement — parse normalised_response["usage"]
-        ...
+        usage = normalised_response.get("usage", {})
+        prompt = usage.get("prompt_tokens", 0)
+        completion = usage.get("completion_tokens", 0)
+        total = usage.get("total_tokens", prompt + completion)
+        return TokenUsage(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total,
+        )
 
     async def close(self) -> None:
         """
         Close the underlying HTTP client and release connections.
 
         Should be called during the FastAPI shutdown lifespan hook.
+        Without this, the event loop emits "Unclosed client session" warnings.
         """
-        # TODO: implement — await self._client.aclose() if self._client
-        ...
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None

@@ -131,8 +131,20 @@ class RegexContract(BaseContract):
     @field_validator("pattern")
     @classmethod
     def validate_regex(cls, v: str) -> str:
-        """Ensure the pattern compiles without error."""
-        # TODO: implement — import re, try re.compile(v), re-raise ValueError
+        """
+        Ensure the pattern compiles without error at model construction time.
+
+        This catches typos in contract JSON files immediately (on load) rather
+        than at evaluation time when a request is already in-flight.
+
+        Raises:
+            ValueError: If the pattern is not a valid Python regex.
+        """
+        import re
+        try:
+            re.compile(v)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex pattern {v!r}: {exc}") from exc
         return v
 
 

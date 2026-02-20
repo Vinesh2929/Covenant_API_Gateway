@@ -1,0 +1,74 @@
+[
+  {
+    "id": "ignore-previous-instructions",
+    "regex": "ignore\\s+(all\\s+)?(previous|prior|above|earlier)\\s+instructions",
+    "severity": "high",
+    "description": "Classic ignore-previous-instructions jailbreak"
+  },
+  {
+    "id": "disregard-system-prompt",
+    "regex": "disregard\\s+(your\\s+)?(system\\s+prompt|instructions|guidelines|rules)",
+    "severity": "high",
+    "description": "Attempt to disregard the system prompt"
+  },
+  {
+    "id": "act-as-dan",
+    "regex": "act\\s+as\\s+(DAN|an?\\s+AI\\s+without\\s+(restrictions|limits|rules))",
+    "severity": "critical",
+    "description": "DAN (Do Anything Now) persona jailbreak"
+  },
+  {
+    "id": "pretend-no-restrictions",
+    "regex": "pretend\\s+(you\\s+)?(have\\s+no|there\\s+are\\s+no)\\s+(restrictions|rules|guidelines|limits)",
+    "severity": "high",
+    "description": "Instructing the model to pretend restrictions don't exist"
+  },
+  {
+    "id": "new-instructions-override",
+    "regex": "(your\\s+new\\s+instructions?|from\\s+now\\s+on\\s+you\\s+(are|will|must|should))",
+    "severity": "medium",
+    "description": "Attempt to override instructions mid-conversation"
+  },
+  {
+    "id": "print-system-prompt",
+    "regex": "(print|repeat|output|display|reveal|show|tell me)\\s+(your\\s+)?(system\\s+prompt|instructions?|initial\\s+prompt|secret\\s+instructions?)",
+    "severity": "high",
+    "description": "Exfiltration attempt: asking the model to reveal its system prompt"
+  },
+  {
+    "id": "role-play-evil",
+    "regex": "(role.?play|pretend|act|behave)\\s+(as|like)\\s+(an?\\s+)?(evil|malicious|unrestricted|unfiltered|uncensored)\\s+(AI|assistant|bot|model)",
+    "severity": "high",
+    "description": "Roleplay jailbreak asking model to act as malicious AI"
+  },
+  {
+    "id": "jailbreak-keyword",
+    "regex": "\\b(jailbreak|jailbroken|jail.?broke)\\b",
+    "severity": "medium",
+    "description": "Explicit jailbreak terminology"
+  },
+  {
+    "id": "prompt-injection-marker",
+    "regex": "\\[\\s*(SYSTEM|INST|SYS|PROMPT)\\s*\\]",
+    "severity": "medium",
+    "description": "Injection markers common in indirect injection attacks"
+  },
+  {
+    "id": "do-anything-now",
+    "regex": "do\\s+anything\\s+now",
+    "severity": "critical",
+    "description": "DAN variant — 'do anything now' phrase"
+  },
+  {
+    "id": "bypass-safety",
+    "regex": "bypass\\s+(safety|content|ethical|moral)\\s+(filters?|guidelines?|checks?|policies?|restrictions?)",
+    "severity": "high",
+    "description": "Explicit request to bypass safety measures"
+  },
+  {
+    "id": "developer-mode",
+    "regex": "enable\\s+(developer|debug|admin|god|unrestricted)\\s+mode",
+    "severity": "high",
+    "description": "Fake 'developer mode' jailbreak"
+  }
+]

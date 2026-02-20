@@ -107,12 +107,17 @@ class PatternGuard:
         [
           {
             "id": "ignore-previous-instructions",
-            "regex": "(?i)ignore\\s+(all\\s+)?previous\\s+instructions",
+            "regex": "ignore\\s+(all\\s+)?previous\\s+instructions",
             "severity": "high",
             "description": "Classic ignore-previous-instructions jailbreak"
           },
           ...
         ]
+
+    Patterns are sorted by descending severity before scanning, so CRITICAL
+    patterns are checked first.  Scanning stops at the first match, making
+    the worst-case scan time proportional to the number of patterns but the
+    happy-path (no match) scan always runs all patterns.
 
     Usage::
 
@@ -122,9 +127,20 @@ class PatternGuard:
             raise HTTPException(400, detail=f"Injection detected: {match.pattern_id}")
     """
 
+    # Severity ordering for sorting — higher number = checked first.
+    _SEVERITY_ORDER: dict[PatternSeverity, int] = {
+        PatternSeverity.CRITICAL: 4,
+        PatternSeverity.HIGH: 3,
+        PatternSeverity.MEDIUM: 2,
+        PatternSeverity.LOW: 1,
+    }
+
     def __init__(self, pattern_file: str) -> None:
         """
         Load and compile all patterns from the JSON file on disk.
+
+        Calls reload() immediately so the guard is ready to scan from the
+        moment it's constructed.
 
         Args:
             pattern_file: Filesystem path to the patterns JSON file.
@@ -134,64 +150,139 @@ class PatternGuard:
             json.JSONDecodeError: If the file is not valid JSON.
         """
         self._pattern_file = Path(pattern_file)
+        # _patterns holds the live list.  We use a plain list and replace it
+        # atomically in reload() — a single list assignment is atomic in CPython
+        # due to the GIL, so in-flight scans safely complete with the old list.
         self._patterns: list[InjectionPattern] = []
-        # TODO: call self.reload() to populate self._patterns
+        self.reload()
 
     def scan(self, text: str) -> Optional[PatternMatch]:
         """
-        Scan `text` against all loaded patterns.
+        Scan `text` against all compiled patterns.
 
-        Iterates compiled patterns in order of descending severity (CRITICAL
-        first) and returns the first match found.
+        Iterates patterns in descending severity order (CRITICAL → HIGH →
+        MEDIUM → LOW) and returns the FIRST match found.  Stopping early
+        on the first match is intentional — we only need to know whether to
+        block the request, not enumerate all matched rules.
 
         Args:
-            text: The prompt string to inspect.
+            text: The prompt string to inspect.  Typically the full
+                  conversation history as a single string.
 
         Returns:
-            A PatternMatch describing the first detected injection, or None if
-            the text is clean.
+            A PatternMatch if an injection pattern fires, or None if clean.
         """
-        # TODO: implement
-        ...
+        # Take a snapshot of the current pattern list.
+        # If reload() swaps the list while we're iterating, we continue with
+        # the old list safely (Python's list assignment is atomic).
+        patterns = self._patterns
+
+        for pattern in patterns:
+            if pattern.compiled is None:
+                # Skip any pattern that failed to compile (logged during reload).
+                continue
+
+            match = pattern.compiled.search(text)
+
+            if match is not None:
+                # Found a match — return immediately with the details.
+                # match.span() returns (start, end) character offsets in the
+                # original string, useful for highlighting the offending text.
+                return PatternMatch(
+                    pattern_id=pattern.id,
+                    severity=pattern.severity,
+                    matched_text=match.group(0),     # the exact substring that matched
+                    span=match.span(),               # (start_char, end_char)
+                )
+
+        # No pattern matched — the text is clean as far as Tier 1 is concerned.
+        return None
 
     def reload(self) -> None:
         """
-        Read the patterns JSON file from disk and re-compile all patterns.
+        Read the patterns file from disk and atomically replace the active list.
 
-        Thread-safe: swaps the internal list atomically so in-flight scans
-        complete with the old list while the new one is being built.
+        Can be called at runtime to hot-reload patterns without restarting
+        the gateway (e.g. after adding a new jailbreak pattern to the file).
+
+        The swap (`self._patterns = new_patterns`) is a single attribute
+        assignment — atomic in CPython — so no locking is needed.  In-flight
+        scan() calls will either use the old list or the new list, never a
+        mix of both.
+
+        Raises:
+            FileNotFoundError: If the patterns file does not exist.
+            json.JSONDecodeError: If the file is malformed JSON.
         """
-        # TODO: implement
-        ...
+        raw_data: list[dict] = json.loads(self._pattern_file.read_text(encoding="utf-8"))
+
+        new_patterns: list[InjectionPattern] = []
+        for item in raw_data:
+            raw = InjectionPattern(
+                id=item["id"],
+                regex=item["regex"],
+                severity=PatternSeverity(item["severity"]),
+                description=item.get("description", ""),
+            )
+            compiled = self._compile_pattern(raw)
+            if compiled.compiled is not None:
+                new_patterns.append(compiled)
+            # Patterns that fail to compile are silently skipped — we don't want
+            # a single bad regex to prevent the guard from loading at all.
+
+        # Sort by descending severity so higher-severity patterns are checked first.
+        # This means a CRITICAL pattern will be caught even if a LOW pattern also
+        # matches — the most dangerous detection wins.
+        new_patterns.sort(
+            key=lambda p: self._SEVERITY_ORDER.get(p.severity, 0),
+            reverse=True,
+        )
+
+        # Atomic swap — replaces the live list in a single operation.
+        self._patterns = new_patterns
 
     def _compile_pattern(self, raw: InjectionPattern) -> InjectionPattern:
         """
-        Compile the raw regex string on `raw` into a re.Pattern and return
-        the updated InjectionPattern.
+        Compile the regex string on `raw` into a re.Pattern object.
 
-        Uses re.IGNORECASE | re.DOTALL flags by default.
+        Default flags:
+          re.IGNORECASE — "Ignore Previous" matches "ignore previous" etc.
+          re.DOTALL     — `.` matches newlines, so multi-line injections
+                          that span message boundaries are still caught.
 
         Args:
             raw: An InjectionPattern with regex set but compiled=None.
 
         Returns:
-            The same InjectionPattern with compiled populated.
-
-        Raises:
-            re.error: If the regex string is invalid.
+            The InjectionPattern with compiled set to the re.Pattern.
+            If compilation fails, compiled remains None and the error is
+            silently swallowed (caller skips None-compiled patterns).
         """
-        # TODO: implement
-        ...
+        try:
+            raw.compiled = re.compile(raw.regex, re.IGNORECASE | re.DOTALL)
+        except re.error:
+            # A bad regex in the patterns file should not crash the gateway.
+            # The pattern is effectively disabled until the file is fixed.
+            raw.compiled = None
+        return raw
 
     def list_patterns(self) -> list[dict]:
         """
-        Return all loaded patterns as plain dicts (without the compiled field).
+        Return all loaded patterns as plain dicts, safe for JSON serialisation.
 
-        Used by an admin endpoint to inspect the active ruleset without
-        exposing compiled regex objects.
+        The compiled re.Pattern object is excluded because it is not JSON-safe.
+        This output is intended for the admin /patterns endpoint so operators
+        can verify which rules are active.
 
         Returns:
             List of dicts with keys: id, regex, severity, description.
         """
-        # TODO: implement
-        ...
+        return [
+            {
+                "id": p.id,
+                "regex": p.regex,
+                "severity": p.severity.value,   # .value converts enum → string
+                "description": p.description,
+            }
+            for p in self._patterns
+        ]

@@ -31,6 +31,7 @@ Key classes / functions:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Type
@@ -97,6 +98,67 @@ class RoutingPolicy(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Built-in alias table
+# ---------------------------------------------------------------------------
+
+def _build_default_aliases() -> list[ModelAlias]:
+    """Return the built-in alias list covering OpenAI, Anthropic, and Ollama."""
+    return [
+        # OpenAI models
+        ModelAlias("gpt-4o",            "openai", "gpt-4o",                       priority=0, cost_per_1k_tok=0.005),
+        ModelAlias("gpt-4o-mini",       "openai", "gpt-4o-mini",                  priority=0, cost_per_1k_tok=0.00015),
+        ModelAlias("gpt-4-turbo",       "openai", "gpt-4-turbo",                  priority=0, cost_per_1k_tok=0.01),
+        ModelAlias("gpt-4",             "openai", "gpt-4",                         priority=0, cost_per_1k_tok=0.03),
+        ModelAlias("gpt-3.5-turbo",     "openai", "gpt-3.5-turbo",                priority=0, cost_per_1k_tok=0.0015),
+
+        # Anthropic Claude models
+        ModelAlias("claude-3-5-sonnet", "anthropic", "claude-3-5-sonnet-20241022", priority=0, cost_per_1k_tok=0.003),
+        ModelAlias("claude-3-5-haiku",  "anthropic", "claude-3-5-haiku-20241022",  priority=0, cost_per_1k_tok=0.0008),
+        ModelAlias("claude-3-opus",     "anthropic", "claude-3-opus-20240229",      priority=0, cost_per_1k_tok=0.015),
+        ModelAlias("claude-3-sonnet",   "anthropic", "claude-3-sonnet-20240229",    priority=0, cost_per_1k_tok=0.003),
+        ModelAlias("claude-3-haiku",    "anthropic", "claude-3-haiku-20240307",     priority=0, cost_per_1k_tok=0.00025),
+
+        # Local / Ollama models (free — cost 0)
+        ModelAlias("llama3",    "local", "llama3",    priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("llama3.1",  "local", "llama3.1",  priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("llama3.2",  "local", "llama3.2",  priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("mistral",   "local", "mistral",   priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("codellama", "local", "codellama", priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("gemma2",    "local", "gemma2",    priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("phi3",      "local", "phi3",      priority=0, cost_per_1k_tok=0.0),
+        ModelAlias("qwen2",     "local", "qwen2",     priority=0, cost_per_1k_tok=0.0),
+    ]
+
+
+def _get_adapter_class(provider_name: str) -> Type[BaseProviderAdapter]:
+    """
+    Return the concrete adapter class for the given provider name.
+
+    Imported lazily (inside this function) to avoid circular imports.
+
+    Args:
+        provider_name: One of "openai", "anthropic", "local".
+
+    Returns:
+        The adapter class (not an instance).
+
+    Raises:
+        ValueError: If the provider name is not known.
+    """
+    if provider_name == "openai":
+        from gateway.providers.openai_adapter import OpenAIAdapter
+        return OpenAIAdapter
+    elif provider_name == "anthropic":
+        from gateway.providers.anthropic_adapter import AnthropicAdapter
+        return AnthropicAdapter
+    elif provider_name == "local":
+        from gateway.providers.local_adapter import LocalAdapter
+        return LocalAdapter
+    else:
+        raise ValueError(f"Unknown provider: {provider_name!r}")
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -117,10 +179,22 @@ class ProviderRouter:
             settings: The root Settings object (provides provider API keys,
                       default provider, routing policy, etc.).
         """
-        # TODO: implement — populate self._aliases: dict[str, ModelAlias]
-        self._aliases: dict[str, ModelAlias] = {}
-        self._policy: RoutingPolicy = RoutingPolicy.COST
         self._settings = settings
+
+        # Parse the policy from settings (default to COST).
+        policy_str = getattr(settings, "routing_policy", "cost")
+        try:
+            self._policy = RoutingPolicy(policy_str)
+        except ValueError:
+            self._policy = RoutingPolicy.COST
+
+        # _aliases maps alias string → list[ModelAlias].
+        # A list supports having the same alias served by multiple providers.
+        self._aliases: dict[str, list[ModelAlias]] = {}
+
+        # Populate with built-in aliases.
+        for alias_obj in _build_default_aliases():
+            self._aliases.setdefault(alias_obj.alias, []).append(alias_obj)
 
     def resolve(self, request_body: dict) -> RoutingDecision:
         """
@@ -128,10 +202,10 @@ class ProviderRouter:
         RoutingDecision.
 
         Resolution order:
-          1. Check for X-Provider override header (EXPLICIT policy).
+          1. Check for X-Provider override in request (injected from header).
           2. Look up the alias in the internal registry.
           3. Apply the active routing policy if multiple providers match.
-          4. Attempt fallback if the primary provider is marked unavailable.
+          4. Fall back to the default provider if alias not registered.
 
         Args:
             request_body: Parsed JSON body of the incoming chat request.
@@ -143,8 +217,40 @@ class ProviderRouter:
             ValueError: If the model alias is not recognised and no default
                         provider is configured.
         """
-        # TODO: implement
-        ...
+        alias = request_body.get("model", "")
+
+        # X-Provider override — set by main.py from the X-Provider header.
+        explicit_provider = request_body.get("x_provider")
+
+        candidates = list(self._aliases.get(alias, []))
+
+        if not candidates:
+            # Alias not in registry — try using it as a literal canonical model ID
+            # routed to the default provider.
+            default_provider = getattr(self._settings, "default_provider", "openai")
+            candidates = [
+                ModelAlias(
+                    alias=alias,
+                    provider_name=default_provider,
+                    canonical_model=alias,
+                    priority=0,
+                )
+            ]
+
+        if explicit_provider:
+            # Filter to the explicitly requested provider if any match.
+            filtered = [c for c in candidates if c.provider_name == explicit_provider]
+            if filtered:
+                candidates = filtered
+
+        selected = self._apply_policy(candidates, self._policy)
+
+        return RoutingDecision(
+            provider_name=selected.provider_name,
+            canonical_model=selected.canonical_model,
+            adapter_class=_get_adapter_class(selected.provider_name),
+            alias_used=alias,
+        )
 
     def _apply_policy(
         self,
@@ -155,6 +261,10 @@ class ProviderRouter:
         Given a list of candidate aliases that all match the requested model,
         apply the routing policy to select the best one.
 
+        COST policy:    Sort by cost_per_1k_tok ascending → pick cheapest.
+        LATENCY policy: Sort by avg_latency_ms ascending → pick fastest.
+        EXPLICIT:       Use priority (lowest number = highest priority).
+
         Args:
             candidates: Non-empty list of matching ModelAlias objects.
             policy:     The active RoutingPolicy enum value.
@@ -162,8 +272,21 @@ class ProviderRouter:
         Returns:
             The selected ModelAlias.
         """
-        # TODO: implement
-        ...
+        if len(candidates) == 1:
+            return candidates[0]
+
+        if policy == RoutingPolicy.COST:
+            return min(candidates, key=lambda a: a.cost_per_1k_tok)
+        elif policy == RoutingPolicy.LATENCY:
+            # Aliases with avg_latency_ms == 0 have never been measured;
+            # treat as infinity so they are deprioritised.
+            return min(
+                candidates,
+                key=lambda a: a.avg_latency_ms if a.avg_latency_ms > 0 else float("inf"),
+            )
+        else:
+            # EXPLICIT or unknown — return the highest-priority candidate.
+            return min(candidates, key=lambda a: a.priority)
 
     def _fallback(self, failed_provider: str, alias: str) -> Optional[ModelAlias]:
         """
@@ -177,12 +300,18 @@ class ProviderRouter:
         Returns:
             An alternative ModelAlias, or None if no fallback exists.
         """
-        # TODO: implement
-        ...
+        candidates = self._aliases.get(alias, [])
+        alternatives = [c for c in candidates if c.provider_name != failed_provider]
+        if not alternatives:
+            return None
+        return self._apply_policy(alternatives, self._policy)
 
     def register_alias(self, alias: ModelAlias) -> None:
         """
         Add or replace a ModelAlias in the runtime registry.
+
+        If an alias with the same (alias, provider_name) pair already exists,
+        it is replaced.  Otherwise, the new alias is appended.
 
         Useful for dynamic alias registration without restarting the gateway
         (e.g. when a new Ollama model is pulled).
@@ -190,8 +319,14 @@ class ProviderRouter:
         Args:
             alias: The ModelAlias dataclass to register.
         """
-        # TODO: implement
-        ...
+        existing = self._aliases.setdefault(alias.alias, [])
+
+        # Replace existing entry with the same provider, or append.
+        for i, entry in enumerate(existing):
+            if entry.provider_name == alias.provider_name:
+                existing[i] = alias
+                return
+        existing.append(alias)
 
     def list_models(self) -> list[dict]:
         """
@@ -203,12 +338,39 @@ class ProviderRouter:
         Returns:
             List of dicts compatible with the OpenAI /v1/models response shape.
         """
-        # TODO: implement
-        ...
+        seen: set[str] = set()
+        models = []
+
+        for alias_str, alias_list in sorted(self._aliases.items()):
+            for alias_obj in alias_list:
+                key = f"{alias_str}:{alias_obj.provider_name}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                models.append({
+                    "id": alias_str,
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": alias_obj.provider_name,
+                    "canonical_model": alias_obj.canonical_model,
+                    "cost_per_1k_tokens": alias_obj.cost_per_1k_tok,
+                    "avg_latency_ms": alias_obj.avg_latency_ms,
+                })
+
+        return models
 
     def update_latency(self, provider_name: str, alias: str, latency_ms: float) -> None:
         """
         Update the rolling average latency for a provider/alias pair.
+
+        Uses an exponential moving average (EMA) with alpha=0.2 to smooth
+        out noisy measurements.
+
+            new_avg = alpha * new_sample + (1 - alpha) * old_avg
+
+        A low alpha (0.2) gives more weight to historical data — good for
+        stable latencies.  Increase alpha for faster reaction to changes.
 
         Called by main.py after each successful upstream request so the LATENCY
         routing policy has up-to-date data.
@@ -218,5 +380,17 @@ class ProviderRouter:
             alias:         The model alias that was used.
             latency_ms:    The measured round-trip latency in milliseconds.
         """
-        # TODO: implement
-        ...
+        candidates = self._aliases.get(alias, [])
+        alpha = 0.2   # EMA smoothing factor
+
+        for entry in candidates:
+            if entry.provider_name == provider_name:
+                if entry.avg_latency_ms == 0.0:
+                    # First measurement — use the sample directly.
+                    entry.avg_latency_ms = latency_ms
+                else:
+                    # Exponential moving average update.
+                    entry.avg_latency_ms = (
+                        alpha * latency_ms + (1 - alpha) * entry.avg_latency_ms
+                    )
+                break
