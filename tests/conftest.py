@@ -148,11 +148,17 @@ def security_guard(settings, pattern_guard, ml_guard_stub):
 # Cache (stub embedder + in-memory FAISS)
 # ---------------------------------------------------------------------------
 
-EMBED_DIM = 8
+EMBED_DIM = 32  # 32-dim vectors: low chance of spurious similarity (std dev ~0.18)
 
 
 class StubEmbedder:
-    """Deterministic embedder for testing — hashes text into 8-dim unit vectors."""
+    """Deterministic embedder for testing — hashes text into 32-dim unit vectors.
+
+    Uses SHA256 as a seed for numpy's RNG so that:
+    - Same text always produces the same vector (fully deterministic).
+    - Different texts produce well-separated vectors (cosine sim ~ 0 expected,
+      std dev ~0.18 in 32D — probability of spurious > 0.92 hit is < 0.001%).
+    """
 
     def __init__(self):
         self._dimension = EMBED_DIM
@@ -166,7 +172,11 @@ class StubEmbedder:
 
     async def embed(self, text: str) -> np.ndarray:
         h = hashlib.sha256(text.encode()).digest()
-        vec = np.frombuffer(h[:EMBED_DIM * 4], dtype=np.float32).copy()
+        # Use the full 256-bit hash as a seed for a reproducible RNG.
+        # numpy default_rng accepts arbitrary integers as seed.
+        seed = int.from_bytes(h, "little") % (2**31)
+        rng = np.random.default_rng(seed)
+        vec = rng.standard_normal(EMBED_DIM).astype(np.float32)
         norm = np.linalg.norm(vec)
         if norm > 0:
             vec /= norm
