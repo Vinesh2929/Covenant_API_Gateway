@@ -94,9 +94,15 @@ nginx/nginx.conf            Reverse proxy, rate limiting, security headers, JSON
 Dockerfile                  Multi-stage: builder installs deps, runtime image is lean (non-root user)
 docker-compose.yml          nginx + gateway + redis + langfuse + postgres + (ollama optional)
 scripts/
-  benchmark_security.py     Benchmarks three injection classifiers (see ML Guard section)
-  generate_test_data.py     Synthetic dataset generation
-  train_classifier.py       Fine-tune loop (DistilBERT/DeBERTa)
+  build_benchmark_dataset.py  Pulls deepset/prompt-injections + Alpaca, outputs data/benchmark_dataset.jsonl
+  benchmark_security.py       Benchmarks three injection classifiers; outputs results/benchmark_results.json
+  download_models.py          Downloads ProtectAI DeBERTa + MiniLM; optional Meta PG2 models
+  generate_test_data.py       Synthetic dataset generation
+  train_classifier.py         Fine-tune loop (DistilBERT/DeBERTa)
+data/
+  .gitkeep                    Placeholder — benchmark_dataset.jsonl written here by build script
+results/
+  .gitkeep                    Placeholder — benchmark_results.json and pr_curve.png written here
 tests/
   conftest.py               Shared fixtures (mostly stubs — see TODO list)
   test_security.py
@@ -198,8 +204,9 @@ tests/
 |------|--------|-------|
 | **`tests/` — full suite** | ✅ Done (63/63 pass) | fakeredis + seeded stub embedder; no external services needed |
 | **`scripts/download_models.py`** | ✅ Done | Downloads ProtectAI DeBERTa + all-MiniLM-L6-v2; optional benchmark models behind `DOWNLOAD_ALL_MODELS` env var |
-| **`scripts/benchmark_security.py`** | ⚠️ Next | Load all 3 models, run same eval set, output precision/recall/F1/latency table; needs benchmark dataset |
-| **README.md** | ⚠️ After benchmark | Needs real numbers at the top before it's worth writing |
+| **`scripts/build_benchmark_dataset.py`** | ✅ Done | Pulls deepset/prompt-injections + tatsu-lab/alpaca, 50/50 balance, writes JSONL to `data/benchmark_dataset.jsonl` |
+| **`scripts/benchmark_security.py`** | ✅ Done | Three-model comparison (ProtectAI DeBERTa-v3, Meta PG2 86M/22M); warmup, latency percentiles, PR curve, JSON output to `results/` |
+| **README.md** | ⚠️ Next | Run benchmark to get real numbers, then write README around them |
 | **Fine-tune loop** | Low | `scripts/train_classifier.py` targets DistilBERT; update for DeBERTa after benchmark establishes baseline |
 
 ---
@@ -292,7 +299,7 @@ cp .env.example .env  # fill in API keys
 redis-server
 
 # 3. Download models
-python scripts/download_models.py   # TODO: not yet written
+python scripts/download_models.py
 
 # 4. Start gateway
 uvicorn gateway.main:app --reload --port 8000
@@ -336,3 +343,6 @@ pytest tests/ -v
 | 2026-02-20 | **Test suite fix — fakeredis Lua scripting**: `fakeredis` does not support `SCRIPT LOAD` / `EVALSHA` by default. The rate-limiter uses a Lua script for atomicity. Fixed by adding `lupa` (Lua runtime) to `requirements-dev.txt` — fakeredis ≥ 2.20 auto-enables Lua when lupa is installed. | 8 rate-limiter tests were erroring at fixture setup with `unknown command 'script'` |
 | 2026-02-20 | `scripts/download_models.py` written and merged | Blocks gateway cold-start without models; now runnable with `python scripts/download_models.py` |
 | 2026-02-20 | **All 63 tests pass** on main. No real Redis, no real models, no API keys required to run the suite. | — |
+| 2026-02-20 | **`scripts/build_benchmark_dataset.py`** written — pulls deepset/prompt-injections (injection) + tatsu-lab/alpaca (clean), 50/50 balance, JSONL output to `data/benchmark_dataset.jsonl` | Needed before benchmark can run; decoupled from benchmark itself so dataset is built once |
+| 2026-02-20 | **`scripts/benchmark_security.py`** fully implemented — three-model comparison (ProtectAI DeBERTa-v3, Meta PromptGuard 86M, Meta PromptGuard 22M), 10-sample warmup before timing, per-sample `time.perf_counter()` latencies, p50/p95/p99, sklearn precision/recall/F1, PR curve sweep, results to `results/benchmark_results.json` | Produces the real numbers needed for README; Meta models gated behind `--all-models` flag + require HF login + Llama license |
+| 2026-02-20 | Created `results/` and `data/` directories with `.gitkeep` | Holds benchmark output and dataset; tracked in git so paths exist on fresh clone |
