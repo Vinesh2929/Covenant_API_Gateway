@@ -1,0 +1,56 @@
+# =============================================================================
+# AI Gateway — Python Dependencies
+# =============================================================================
+# Install with: pip install -r requirements.txt
+# For development (includes test tools): pip install -r requirements.txt -r requirements-dev.txt
+
+# ---------------------------------------------------------------------------
+# Web framework & server
+# ---------------------------------------------------------------------------
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12          # required for FastAPI form parsing
+httpx==0.27.2                     # async HTTP client for provider adapters
+
+# ---------------------------------------------------------------------------
+# Configuration management
+# ---------------------------------------------------------------------------
+pydantic==2.9.2
+pydantic-settings==2.6.1
+python-dotenv==1.0.1
+
+# ---------------------------------------------------------------------------
+# Redis (async)
+# ---------------------------------------------------------------------------
+redis[asyncio]==5.1.1             # includes redis.asyncio
+
+# ---------------------------------------------------------------------------
+# ML — DistilBERT injection classifier
+# ---------------------------------------------------------------------------
+transformers==4.46.2
+torch==2.5.1                      # CPU-only; for CUDA install torch with the right index URL
+tokenizers==0.20.3                # fast tokenizer backend (installed with transformers)
+
+# ---------------------------------------------------------------------------
+# Semantic cache — embeddings + FAISS
+# ---------------------------------------------------------------------------
+sentence-transformers==3.3.0
+faiss-cpu==1.9.0                  # CPU FAISS; replace with faiss-gpu for GPU deployments
+numpy==1.26.4                     # FAISS and sentence-transformers require numpy < 2.0
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+langfuse==2.53.3                  # official Langfuse Python SDK
+
+# ---------------------------------------------------------------------------
+# Contract evaluation
+# ---------------------------------------------------------------------------
+jsonschema==4.23.0                # JSON Schema validation for SchemaContract
+# sentiment analysis model is loaded via transformers (no extra install needed)
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+python-jose[cryptography]==3.3.0  # JWT handling for API key validation (optional)
+structlog==24.4.0                 # structured JSON logging

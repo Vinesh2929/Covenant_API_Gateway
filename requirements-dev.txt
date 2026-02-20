@@ -1,0 +1,25 @@
+# =============================================================================
+# Development & test dependencies (not needed in production Docker image)
+# =============================================================================
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-mock==3.14.0
+httpx==0.27.2                     # async test client (also in main requirements)
+fakeredis==2.26.1                 # in-memory Redis for tests
+freezegun==1.5.1                  # time mocking for rate-limiter sliding window tests
+
+# Code quality
+ruff==0.7.4                       # linter + formatter (replaces flake8 + isort + black)
+mypy==1.13.0                      # static type checking
+pre-commit==4.0.1                 # git hooks for linting before commits
+
+# Training scripts
+scikit-learn==1.5.2               # train/test split, metrics for classifier training
+matplotlib==3.9.2                 # PR curve plots in benchmark_security.py
+datasets==3.1.0                   # Hugging Face Datasets for training pipeline
+accelerate==1.1.1                 # Hugging Face Trainer acceleration
+
+# Load testing helpers
+# (k6 and wrk are separate CLI tools — see README for setup)
