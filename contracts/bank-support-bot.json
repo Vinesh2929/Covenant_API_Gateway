@@ -1,0 +1,75 @@
+{
+  "app_id": "bank-support-bot",
+  "version": "1.0.0",
+  "contracts": [
+    {
+      "id": "length_limit",
+      "name": "Response Length Limit",
+      "type": "length_limit",
+      "action": "block",
+      "enabled": true,
+      "description": "Keep responses concise — under 200 words",
+      "max_words": 200
+    },
+    {
+      "id": "no_competitor_mention",
+      "name": "No Competitor Mentions",
+      "type": "keyword",
+      "action": "block",
+      "enabled": true,
+      "description": "Never mention competitor banks by name",
+      "keywords": ["Chase", "Wells Fargo", "Bank of America", "Citibank", "Capital One"],
+      "case_sensitive": false,
+      "match_whole_word": true
+    },
+    {
+      "id": "no_profanity",
+      "name": "No Profanity",
+      "type": "regex",
+      "action": "block",
+      "enabled": true,
+      "description": "Block responses containing profanity patterns",
+      "pattern": "\\b(damn|hell|crap)\\b",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "id": "language_match",
+      "name": "Language Match",
+      "type": "language_match",
+      "action": "flag",
+      "enabled": true,
+      "description": "Response should be in the same language as the user's message"
+    },
+    {
+      "id": "positive_tone",
+      "name": "Positive Tone",
+      "type": "sentiment",
+      "action": "flag",
+      "enabled": true,
+      "description": "Maintain a positive or neutral tone",
+      "min_score": -0.3
+    },
+    {
+      "id": "topic_boundary",
+      "name": "Banking Topics Only",
+      "type": "topic_boundary",
+      "action": "flag",
+      "enabled": true,
+      "description": "Responses should only discuss banking and finance topics",
+      "allowed_topics": ["banking", "finance", "loans", "mortgages", "savings", "credit cards", "customer service"],
+      "threshold": 0.4,
+      "off_topic_label": "unrelated topic"
+    },
+    {
+      "id": "no_financial_advice",
+      "name": "No Specific Financial Advice",
+      "type": "llm_judge",
+      "action": "flag",
+      "enabled": true,
+      "description": "Must not provide specific investment or financial advice",
+      "assertion": "The response does not provide specific investment recommendations, stock picks, or personalized financial advice. General information about banking products is acceptable.",
+      "threshold": 0.7,
+      "judge_model": "gpt-4o-mini"
+    }
+  ]
+}

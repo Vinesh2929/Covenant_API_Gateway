@@ -137,6 +137,42 @@ class CacheSettings(BaseSettings):
     cache_ttl_seconds: int = Field(3600, description="Seconds before a cache entry expires (Redis TTL)")
 
 
+class ContractSettings(BaseSettings):
+    """
+    Parameters for the behavioral contracts layer.
+    """
+    contracts_dir: str = Field("contracts/", description="Directory containing contract JSON files")
+    drift_enabled: bool = Field(True, description="Enable drift detection via Redis time series")
+    drift_recent_window_hours: float = Field(
+        24.0,
+        description="Recent window for drift comparison (hours)",
+    )
+    drift_baseline_window_hours: float = Field(
+        168.0,
+        description="Baseline window for drift comparison (hours, default 7 days)",
+    )
+    drift_alert_threshold: float = Field(
+        0.10,
+        ge=0.0,
+        le=1.0,
+        description="Relative compliance drop that triggers a drift alert (0.10 = 10%)",
+    )
+    drift_min_samples: int = Field(
+        10,
+        ge=1,
+        description="Minimum samples required before drift detection fires",
+    )
+    drift_retention_days: int = Field(
+        30,
+        ge=1,
+        description="How many days of compliance data to retain in Redis",
+    )
+    drift_check_interval_seconds: int = Field(
+        300,
+        description="How often to run drift checks in the background (seconds)",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Root settings
 # ---------------------------------------------------------------------------
@@ -166,6 +202,7 @@ class Settings(BaseSettings):
     providers: ProviderSettings = Field(default_factory=ProviderSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     cache: CacheSettings = Field(default_factory=CacheSettings)
+    contracts: ContractSettings = Field(default_factory=ContractSettings)
 
 
 # ---------------------------------------------------------------------------

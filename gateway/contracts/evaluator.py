@@ -3,34 +3,30 @@ gateway/contracts/evaluator.py
 
 Evaluates a single behavioral contract rule against a (request, response) pair.
 
-Responsibilities:
-  - Implement an evaluation function for each contract type (keyword, regex,
-    sentiment, schema, composite).
-  - Return a structured EvaluationResult that records: which contract fired,
-    the violation details, and whether the request should be blocked or just
-    logged.
-  - Be stateless: evaluators receive all context they need as arguments and
-    produce deterministic outputs (no side effects).
-  - Make it easy to add new contract types by implementing the ContractEvaluator
-    protocol — one evaluate() method per type.
+Three evaluation tiers with different cost profiles:
 
-Key classes / functions:
-  - ViolationDetail           — dataclass: what exactly was violated and where
-  - EvaluationResult          — dataclass: passed, action, contract_id, violation
-  - ContractEvaluator         — abstract base / Protocol for per-type evaluators
-  - KeywordEvaluator          — evaluates KeywordContract
-  - RegexEvaluator            — evaluates RegexContract
-  - SentimentEvaluator        — evaluates SentimentContract (async, uses HF model)
-  - SchemaEvaluator           — evaluates SchemaContract (uses jsonschema library)
-  - CompositeEvaluator        — evaluates CompositeContract recursively
-  - evaluate_contract(...)    — top-level dispatcher function
+  Deterministic (< 1ms):
+    KeywordEvaluator, RegexEvaluator, LengthLimitEvaluator,
+    LanguageMatchEvaluator, SchemaEvaluator
+
+  Classifier (~10-15ms):
+    SentimentEvaluator, TopicBoundaryEvaluator
+
+  LLM Judge (~100-300ms):
+    LLMJudgeEvaluator
+
+Every evaluator returns an EvaluationResult with a compliance_score (0.0-1.0)
+for drift detection.  Deterministic checks return 1.0 (pass) or 0.0 (fail).
+Classifier and LLM judge checks return continuous scores.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import re
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
 from gateway.contracts.schema import (
@@ -38,10 +34,15 @@ from gateway.contracts.schema import (
     CompositeContract,
     ContractAction,
     ContractType,
+    EvaluationTier,
     KeywordContract,
+    LanguageMatchContract,
+    LengthLimitContract,
+    LLMJudgeContract,
     RegexContract,
     SchemaContract,
     SentimentContract,
+    TopicBoundaryContract,
 )
 
 
@@ -51,15 +52,6 @@ from gateway.contracts.schema import (
 
 @dataclass
 class ViolationDetail:
-    """
-    Describes the specific aspect of the response that violated the contract.
-
-    Attributes:
-        contract_id:  The ID of the contract rule that was violated.
-        message:      Human-readable description of the violation.
-        evidence:     The offending text snippet or field value.
-        location:     Where in the response the violation was found (e.g. field path).
-    """
     contract_id: str
     message: str
     evidence: Optional[str] = None
@@ -71,32 +63,25 @@ class EvaluationResult:
     """
     Output of a single contract evaluation.
 
-    Attributes:
-        passed:      True if the response satisfies the contract.
-        action:      The ContractAction to take if not passed (None if passed).
-        contract_id: The ID of the evaluated contract.
-        violation:   ViolationDetail if not passed, else None.
+    compliance_score is the key addition for drift detection: a continuous
+    0.0-1.0 value where 1.0 = fully compliant and 0.0 = clear violation.
+    Deterministic checks produce binary 0/1; classifiers and LLM judges
+    produce continuous values.
     """
     passed: bool
     action: Optional[ContractAction]
     contract_id: str
+    evaluation_tier: EvaluationTier = EvaluationTier.DETERMINISTIC
+    compliance_score: float = 1.0
+    latency_ms: float = 0.0
     violation: Optional[ViolationDetail] = None
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract response text
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _extract_response_text(response: dict) -> str:
-    """
-    Extract the assistant message content from a normalised response dict.
-
-    Args:
-        response: Normalised OpenAI-schema response dict.
-
-    Returns:
-        The assistant's reply as a plain string, or "" if not found.
-    """
     try:
         return response["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError):
@@ -104,30 +89,29 @@ def _extract_response_text(response: dict) -> str:
 
 
 def _resolve_target_field(response: dict, target_field: Optional[str]) -> Any:
-    """
-    Navigate a dot-notation path (e.g. "choices.0.message.content") through
-    a nested dict/list structure.
-
-    Args:
-        response:     The response dict to traverse.
-        target_field: Dot-separated path, or None to return the whole response.
-
-    Returns:
-        The value at the specified path, or the entire response if path is None.
-
-    Raises:
-        KeyError / IndexError: If the path does not exist.
-    """
     if not target_field:
         return response
-
     obj: Any = response
     for part in target_field.split("."):
         if isinstance(obj, list):
-            obj = obj[int(part)]  # numeric index into list
+            obj = obj[int(part)]
         else:
             obj = obj[part]
     return obj
+
+
+def _extract_user_text(request: dict) -> str:
+    """Extract the last user message from the request for language detection."""
+    messages = request.get("messages", [])
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                return " ".join(parts)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -135,64 +119,27 @@ def _resolve_target_field(response: dict, target_field: Optional[str]) -> Any:
 # ---------------------------------------------------------------------------
 
 class ContractEvaluator(Protocol):
-    """
-    Protocol that all per-type evaluators must satisfy.
-
-    Each evaluator is responsible for exactly one AnyContract subtype and
-    exposes a single evaluate() method.
-    """
-
     async def evaluate(
         self,
         contract: AnyContract,
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Evaluate `contract` against the given request/response pair.
-
-        Args:
-            contract: The contract definition (subtype must match the evaluator).
-            request:  The original chat completion request body (normalised).
-            response: The upstream provider response body (normalised).
-
-        Returns:
-            An EvaluationResult with passed=True or the violation details.
-        """
         ...
 
 
 # ---------------------------------------------------------------------------
-# Concrete evaluators
+# Deterministic evaluators (< 1ms)
 # ---------------------------------------------------------------------------
 
 class KeywordEvaluator:
-    """
-    Evaluates a KeywordContract by scanning the response content text for
-    any of the listed keywords.
-    """
-
     async def evaluate(
         self,
         contract: KeywordContract,
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Search the response message content for each keyword in the contract.
-
-        Matching behaviour:
-          - case_sensitive=False (default): converts both sides to lowercase.
-          - match_whole_word=True: wraps keyword in \\b word-boundary anchors.
-
-        Args:
-            contract: A KeywordContract with the keywords list and flags.
-            request:  Normalised request body (unused by this evaluator).
-            response: Normalised response body; checks choices[0].message.content.
-
-        Returns:
-            EvaluationResult(passed=False) if any keyword is found, else passed=True.
-        """
+        start = time.perf_counter()
         text = _extract_response_text(response)
         search_text = text if contract.case_sensitive else text.lower()
 
@@ -200,10 +147,8 @@ class KeywordEvaluator:
             needle = keyword if contract.case_sensitive else keyword.lower()
 
             if contract.match_whole_word:
-                # Use a regex word-boundary search for whole-word matching.
                 pattern = r"\b" + re.escape(needle) + r"\b"
-                match = re.search(pattern, search_text)
-                found = match is not None
+                found = re.search(pattern, search_text) is not None
             else:
                 found = needle in search_text
 
@@ -212,6 +157,9 @@ class KeywordEvaluator:
                     passed=False,
                     action=contract.action,
                     contract_id=contract.id,
+                    evaluation_tier=EvaluationTier.DETERMINISTIC,
+                    compliance_score=0.0,
+                    latency_ms=(time.perf_counter() - start) * 1000,
                     violation=ViolationDetail(
                         contract_id=contract.id,
                         message=f"Response contains forbidden keyword: {keyword!r}",
@@ -220,38 +168,24 @@ class KeywordEvaluator:
                     ),
                 )
 
-        return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.DETERMINISTIC,
+            compliance_score=1.0,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
 
 
 class RegexEvaluator:
-    """
-    Evaluates a RegexContract by running re.search on the response content.
-    """
-
     async def evaluate(
         self,
         contract: RegexContract,
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Compile the contract's regex (with any specified flags) and search
-        the response content.
-
-        The contract is violated when the pattern MATCHES (re.search returns
-        a result).  This means: "alert if the pattern appears in the response."
-
-        Args:
-            contract: A RegexContract with pattern and optional flags list.
-            request:  Normalised request body.
-            response: Normalised response body.
-
-        Returns:
-            EvaluationResult(passed=False) if the pattern matches, else passed=True.
-        """
+        start = time.perf_counter()
         text = _extract_response_text(response)
 
-        # Build the combined flags integer from the list of flag names.
         combined_flags = 0
         for flag_name in contract.flags:
             flag = getattr(re, flag_name.upper(), None)
@@ -266,31 +200,256 @@ class RegexEvaluator:
                 passed=False,
                 action=contract.action,
                 contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=0.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
                 violation=ViolationDetail(
                     contract_id=contract.id,
                     message=f"Response matches forbidden pattern: {contract.pattern!r}",
-                    evidence=match.group(0)[:200],   # cap evidence at 200 chars
+                    evidence=match.group(0)[:200],
                     location=f"choices[0].message.content[{match.start()}:{match.end()}]",
                 ),
             )
 
-        return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.DETERMINISTIC,
+            compliance_score=1.0,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
 
+
+class LengthLimitEvaluator:
+    """Evaluates word, character, and sentence count limits."""
+
+    @staticmethod
+    def _count_sentences(text: str) -> int:
+        import re as _re
+        sentences = _re.split(r'[.!?]+', text)
+        return len([s for s in sentences if s.strip()])
+
+    async def evaluate(
+        self,
+        contract: LengthLimitContract,
+        request: dict,
+        response: dict,
+    ) -> EvaluationResult:
+        start = time.perf_counter()
+        text = _extract_response_text(response)
+        violations: list[str] = []
+
+        if contract.max_words is not None:
+            word_count = len(text.split())
+            if word_count > contract.max_words:
+                violations.append(f"Word count {word_count} exceeds limit {contract.max_words}")
+
+        if contract.max_characters is not None:
+            char_count = len(text)
+            if char_count > contract.max_characters:
+                violations.append(f"Character count {char_count} exceeds limit {contract.max_characters}")
+
+        if contract.max_sentences is not None:
+            sentence_count = self._count_sentences(text)
+            if sentence_count > contract.max_sentences:
+                violations.append(f"Sentence count {sentence_count} exceeds limit {contract.max_sentences}")
+
+        elapsed = (time.perf_counter() - start) * 1000
+
+        if violations:
+            return EvaluationResult(
+                passed=False,
+                action=contract.action,
+                contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=0.0,
+                latency_ms=elapsed,
+                violation=ViolationDetail(
+                    contract_id=contract.id,
+                    message="; ".join(violations),
+                    evidence=f"text_length={len(text)}",
+                    location="choices[0].message.content",
+                ),
+            )
+
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.DETERMINISTIC,
+            compliance_score=1.0,
+            latency_ms=elapsed,
+        )
+
+
+class LanguageMatchEvaluator:
+    """
+    Verify response language matches the user's message language.
+
+    Uses langdetect which is fast (~1ms) and works for 55 languages.
+    Falls open: if detection fails, the contract passes.
+    """
+
+    async def evaluate(
+        self,
+        contract: LanguageMatchContract,
+        request: dict,
+        response: dict,
+    ) -> EvaluationResult:
+        start = time.perf_counter()
+        response_text = _extract_response_text(response)
+
+        if not response_text.strip():
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        try:
+            from langdetect import detect as lang_detect  # type: ignore[import]
+        except ImportError:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        try:
+            if contract.expected_language:
+                expected_lang = contract.expected_language
+            else:
+                user_text = _extract_user_text(request)
+                if not user_text.strip():
+                    return EvaluationResult(
+                        passed=True, action=None, contract_id=contract.id,
+                        evaluation_tier=EvaluationTier.DETERMINISTIC,
+                        compliance_score=1.0,
+                        latency_ms=(time.perf_counter() - start) * 1000,
+                    )
+                expected_lang = lang_detect(user_text)
+
+            detected_lang = lang_detect(response_text)
+        except Exception:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        elapsed = (time.perf_counter() - start) * 1000
+        matched = detected_lang == expected_lang
+
+        if not matched:
+            return EvaluationResult(
+                passed=False,
+                action=contract.action,
+                contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=0.0,
+                latency_ms=elapsed,
+                violation=ViolationDetail(
+                    contract_id=contract.id,
+                    message=f"Language mismatch: expected '{expected_lang}', detected '{detected_lang}'",
+                    evidence=f"detected={detected_lang}, expected={expected_lang}",
+                    location="choices[0].message.content",
+                ),
+            )
+
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.DETERMINISTIC,
+            compliance_score=1.0,
+            latency_ms=elapsed,
+        )
+
+
+class SchemaEvaluator:
+    async def evaluate(
+        self,
+        contract: SchemaContract,
+        request: dict,
+        response: dict,
+    ) -> EvaluationResult:
+        start = time.perf_counter()
+        try:
+            import jsonschema  # type: ignore[import]
+        except ImportError:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        try:
+            target = _resolve_target_field(response, contract.target_field)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return EvaluationResult(
+                passed=False,
+                action=contract.action,
+                contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=0.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                violation=ViolationDetail(
+                    contract_id=contract.id,
+                    message=f"Could not extract target field {contract.target_field!r}: {exc}",
+                    location=contract.target_field,
+                ),
+            )
+
+        if isinstance(target, str):
+            try:
+                target = _json.loads(target)
+            except _json.JSONDecodeError:
+                pass
+
+        try:
+            jsonschema.validate(instance=target, schema=contract.json_schema)
+        except jsonschema.ValidationError as exc:
+            return EvaluationResult(
+                passed=False,
+                action=contract.action,
+                contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=0.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+                violation=ViolationDetail(
+                    contract_id=contract.id,
+                    message=f"JSON Schema validation failed: {exc.message}",
+                    evidence=str(exc.instance)[:200],
+                    location=contract.target_field or "response",
+                ),
+            )
+        except jsonschema.SchemaError:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.DETERMINISTIC,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.DETERMINISTIC,
+            compliance_score=1.0,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Classifier evaluators (~10-15ms)
+# ---------------------------------------------------------------------------
 
 class SentimentEvaluator:
     """
-    Evaluates a SentimentContract using a Hugging Face sentiment pipeline.
-
-    The pipeline is shared across all evaluations (lazy-loaded on first call)
-    to avoid loading the model repeatedly.
-
-    The HuggingFace pipeline maps text to one of POSITIVE/NEUTRAL/NEGATIVE.
-    We convert this to a numeric score: POSITIVE=+1, NEUTRAL=0, NEGATIVE=-1,
-    which is then compared against contract.min_score.
+    Evaluates sentiment using a HuggingFace pipeline.
+    Returns a continuous compliance_score for drift detection.
     """
 
-    _pipeline = None  # class-level shared pipeline instance
-    _pipeline_model: str = ""  # track which model the pipeline was loaded for
+    _pipeline = None
+    _pipeline_model: str = ""
 
     async def evaluate(
         self,
@@ -298,29 +457,19 @@ class SentimentEvaluator:
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Score the response content with a sentiment model and check against
-        the minimum threshold.
-
-        The sentiment pipeline runs in a thread pool to avoid blocking the
-        event loop during inference.
-
-        Args:
-            contract: A SentimentContract with min_score and model name.
-            request:  Normalised request body.
-            response: Normalised response body.
-
-        Returns:
-            EvaluationResult(passed=False) if sentiment < min_score.
-        """
+        start = time.perf_counter()
         text = _extract_response_text(response)
         if not text:
-            return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
 
         loop = asyncio.get_event_loop()
 
         def _run_sentiment() -> float:
-            # Lazy-load the pipeline (blocking, happens once per process).
             if (
                 SentimentEvaluator._pipeline is None
                 or SentimentEvaluator._pipeline_model != contract.model
@@ -331,12 +480,10 @@ class SentimentEvaluator:
                 )
                 SentimentEvaluator._pipeline_model = contract.model
 
-            result = SentimentEvaluator._pipeline(text[:512])[0]  # cap at 512 chars
+            result = SentimentEvaluator._pipeline(text[:512])[0]
             label = result.get("label", "").upper()
             score = result.get("score", 0.5)
 
-            # Map label + confidence to a numeric compound score.
-            # POSITIVE → +score, NEGATIVE → -score, NEUTRAL → 0
             if "POSITIVE" in label or "POS" in label:
                 return score
             elif "NEGATIVE" in label or "NEG" in label:
@@ -346,15 +493,33 @@ class SentimentEvaluator:
 
         try:
             compound_score = await loop.run_in_executor(None, _run_sentiment)
-        except Exception as exc:
-            # If the sentiment model fails, pass the contract (fail open).
-            return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        except Exception:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
 
-        if compound_score < contract.min_score:
+        # Map the raw sentiment score to a 0-1 compliance score.
+        # If min_score is 0.3 and compound is 0.5, compliance is high.
+        # If compound is -0.2, compliance is low.
+        if contract.min_score >= 0:
+            compliance = max(0.0, min(1.0, (compound_score - contract.min_score + 1.0) / 2.0))
+        else:
+            compliance = 1.0 if compound_score >= contract.min_score else 0.0
+
+        elapsed = (time.perf_counter() - start) * 1000
+        passed = compound_score >= contract.min_score
+
+        if not passed:
             return EvaluationResult(
                 passed=False,
                 action=contract.action,
                 contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=compliance,
+                latency_ms=elapsed,
                 violation=ViolationDetail(
                     contract_id=contract.id,
                     message=(
@@ -366,175 +531,368 @@ class SentimentEvaluator:
                 ),
             )
 
-        return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.CLASSIFIER,
+            compliance_score=compliance,
+            latency_ms=elapsed,
+        )
 
 
-class SchemaEvaluator:
+class TopicBoundaryEvaluator:
     """
-    Evaluates a SchemaContract using the jsonschema library.
+    Uses zero-shot classification (NLI-based) to check whether the response
+    stays within allowed topics.
+
+    The zero-shot approach means you define topics in plain English — no
+    custom training data needed.  The model (default: facebook/bart-large-mnli)
+    scores the response against each candidate label.
+    """
+
+    _classifier = None
+    _classifier_model: str = ""
+
+    async def evaluate(
+        self,
+        contract: TopicBoundaryContract,
+        request: dict,
+        response: dict,
+    ) -> EvaluationResult:
+        start = time.perf_counter()
+        text = _extract_response_text(response)
+
+        if not text.strip():
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        loop = asyncio.get_event_loop()
+
+        def _run_classification() -> dict:
+            if (
+                TopicBoundaryEvaluator._classifier is None
+                or TopicBoundaryEvaluator._classifier_model != contract.model
+            ):
+                from transformers import pipeline as hf_pipeline  # type: ignore[import]
+                TopicBoundaryEvaluator._classifier = hf_pipeline(
+                    "zero-shot-classification", model=contract.model
+                )
+                TopicBoundaryEvaluator._classifier_model = contract.model
+
+            candidate_labels = list(contract.allowed_topics) + [contract.off_topic_label]
+            result = TopicBoundaryEvaluator._classifier(
+                text[:512],
+                candidate_labels=candidate_labels,
+            )
+            return result
+
+        try:
+            result = await loop.run_in_executor(None, _run_classification)
+        except Exception:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
+
+        labels = result.get("labels", [])
+        scores = result.get("scores", [])
+        elapsed = (time.perf_counter() - start) * 1000
+
+        if not labels:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=1.0,
+                latency_ms=elapsed,
+            )
+
+        top_label = labels[0]
+        top_score = scores[0]
+
+        # Compliance score: sum of scores for allowed topics
+        allowed_set = set(t.lower() for t in contract.allowed_topics)
+        compliance = sum(
+            s for l, s in zip(labels, scores)
+            if l.lower() in allowed_set
+        )
+
+        on_topic = (
+            top_label.lower() in allowed_set
+            and top_score >= contract.threshold
+        )
+
+        if not on_topic:
+            return EvaluationResult(
+                passed=False,
+                action=contract.action,
+                contract_id=contract.id,
+                evaluation_tier=EvaluationTier.CLASSIFIER,
+                compliance_score=compliance,
+                latency_ms=elapsed,
+                violation=ViolationDetail(
+                    contract_id=contract.id,
+                    message=(
+                        f"Response classified as '{top_label}' ({top_score:.3f}) "
+                        f"which is outside allowed topics: {contract.allowed_topics}"
+                    ),
+                    evidence=f"top_label={top_label}, score={top_score:.3f}",
+                    location="choices[0].message.content",
+                ),
+            )
+
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.CLASSIFIER,
+            compliance_score=compliance,
+            latency_ms=elapsed,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LLM Judge evaluator (~100-300ms)
+# ---------------------------------------------------------------------------
+
+class LLMJudgeEvaluator:
+    """
+    Uses a small LLM to evaluate complex natural-language assertions.
+
+    The judge model is called through the gateway's own provider system so
+    it benefits from the same routing, retry, and observability infrastructure.
+
+    The judge prompt asks the model to return a JSON compliance score.
+    Parsing failures are handled gracefully (fail open).
     """
 
     async def evaluate(
         self,
-        contract: SchemaContract,
+        contract: LLMJudgeContract,
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Parse the response field specified by contract.target_field and
-        validate it against contract.json_schema.
+        start = time.perf_counter()
+        response_text = _extract_response_text(response)
 
-        If target_field is set (e.g. "choices.0.message.content"), the value
-        at that path is extracted and validated.  If None, the entire response
-        dict is validated.
+        if not response_text.strip():
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.LLM_JUDGE,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
 
-        Note: If the content is a JSON string (common with structured-output
-        prompts), we try to parse it before validation.
+        judge_request = {
+            "model": contract.judge_model,
+            "messages": [
+                {"role": "system", "content": contract.system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Assertion: {contract.assertion}\n\n"
+                        f"Response to evaluate:\n{response_text[:2000]}"
+                    ),
+                },
+            ],
+            "temperature": 0.0,
+            "max_tokens": 150,
+        }
 
-        Args:
-            contract: A SchemaContract with json_schema and optional target_field.
-            request:  Normalised request body.
-            response: Normalised response body.
-
-        Returns:
-            EvaluationResult(passed=False) with jsonschema errors if invalid.
-        """
-        import json as _json
         try:
-            import jsonschema  # type: ignore[import]
-        except ImportError:
-            # jsonschema not installed — pass the contract (fail open).
-            return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+            score, reasoning = await self._call_judge(judge_request)
+        except Exception:
+            return EvaluationResult(
+                passed=True, action=None, contract_id=contract.id,
+                evaluation_tier=EvaluationTier.LLM_JUDGE,
+                compliance_score=1.0,
+                latency_ms=(time.perf_counter() - start) * 1000,
+            )
 
-        # Extract the target value (field or whole response).
-        try:
-            target = _resolve_target_field(response, contract.target_field)
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+        elapsed = (time.perf_counter() - start) * 1000
+        passed = score >= contract.threshold
+
+        if not passed:
             return EvaluationResult(
                 passed=False,
                 action=contract.action,
                 contract_id=contract.id,
+                evaluation_tier=EvaluationTier.LLM_JUDGE,
+                compliance_score=score,
+                latency_ms=elapsed,
                 violation=ViolationDetail(
                     contract_id=contract.id,
-                    message=f"Could not extract target field {contract.target_field!r}: {exc}",
-                    location=contract.target_field,
+                    message=(
+                        f"LLM judge scored {score:.3f} (threshold {contract.threshold:.3f}): "
+                        f"{reasoning}"
+                    ),
+                    evidence=f"score={score:.3f}, reasoning={reasoning[:200]}",
+                    location="choices[0].message.content",
                 ),
             )
 
-        # If the target is a string, try to parse it as JSON (structured output).
-        if isinstance(target, str):
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=EvaluationTier.LLM_JUDGE,
+            compliance_score=score,
+            latency_ms=elapsed,
+        )
+
+    async def _call_judge(self, judge_request: dict) -> tuple[float, str]:
+        """
+        Call the judge model via the gateway's provider system.
+
+        Uses a lazy import of ProviderRouter to avoid circular imports.
+        Falls back to httpx direct call if the router isn't available.
+        """
+        try:
+            from gateway.router import ProviderRouter
+            from gateway.config import get_settings
+
+            settings = get_settings()
+            router = ProviderRouter(settings)
+            routing = router.resolve(judge_request)
+            adapter = routing.adapter_class(settings.providers)
+            response_body = await adapter.complete(judge_request)
+        except Exception:
+            # Fallback: try calling via httpx to a local endpoint
+            import httpx
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "http://localhost:8000/v1/chat/completions",
+                    json=judge_request,
+                    headers={"Authorization": "Bearer internal-judge"},
+                )
+                resp.raise_for_status()
+                response_body = resp.json()
+
+        content = response_body["choices"][0]["message"]["content"]
+        return self._parse_judge_response(content)
+
+    @staticmethod
+    def _parse_judge_response(content: str) -> tuple[float, str]:
+        """Parse the JSON score from the judge model's response."""
+        content = content.strip()
+
+        # Try direct JSON parse
+        try:
+            parsed = _json.loads(content)
+            score = float(parsed.get("score", 0.5))
+            reasoning = str(parsed.get("reasoning", ""))
+            return max(0.0, min(1.0, score)), reasoning
+        except (_json.JSONDecodeError, ValueError, AttributeError):
+            pass
+
+        # Try extracting JSON from markdown code block
+        import re as _re
+        json_match = _re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, _re.DOTALL)
+        if json_match:
             try:
-                target = _json.loads(target)
-            except _json.JSONDecodeError:
-                pass  # Validate the raw string against the schema
+                parsed = _json.loads(json_match.group(1))
+                score = float(parsed.get("score", 0.5))
+                reasoning = str(parsed.get("reasoning", ""))
+                return max(0.0, min(1.0, score)), reasoning
+            except (_json.JSONDecodeError, ValueError):
+                pass
 
-        # Validate against the JSON Schema.
-        try:
-            jsonschema.validate(instance=target, schema=contract.json_schema)
-        except jsonschema.ValidationError as exc:
-            return EvaluationResult(
-                passed=False,
-                action=contract.action,
-                contract_id=contract.id,
-                violation=ViolationDetail(
-                    contract_id=contract.id,
-                    message=f"JSON Schema validation failed: {exc.message}",
-                    evidence=str(exc.instance)[:200],
-                    location=contract.target_field or "response",
-                ),
-            )
-        except jsonschema.SchemaError as exc:
-            # The schema itself is invalid — pass the contract and log.
-            return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        # Try finding a bare number
+        num_match = _re.search(r'(\d+\.?\d*)', content)
+        if num_match:
+            score = float(num_match.group(1))
+            if score > 1.0:
+                score = score / 100.0
+            return max(0.0, min(1.0, score)), content[:200]
 
-        return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        # Default: ambiguous, assume moderate compliance
+        return 0.5, f"Could not parse judge response: {content[:200]}"
 
+
+# ---------------------------------------------------------------------------
+# Composite evaluator
+# ---------------------------------------------------------------------------
 
 class CompositeEvaluator:
-    """
-    Evaluates a CompositeContract by recursively evaluating sub-contracts and
-    applying the AND / OR operator.
-    """
-
     async def evaluate(
         self,
         contract: CompositeContract,
         request: dict,
         response: dict,
     ) -> EvaluationResult:
-        """
-        Evaluate all sub-contracts and combine results with AND or OR logic.
-
-        OR  logic (default): The composite FAILS when ANY sub-contract fails.
-                             This is the most common use — "block if any rule fires."
-        AND logic:           The composite FAILS only when ALL sub-contracts fail.
-                             Useful for "block only when multiple conditions coexist."
-
-        Sub-contracts are evaluated concurrently via asyncio.gather() for
-        efficiency when multiple slow (sentiment, schema) checks are combined.
-
-        Args:
-            contract: A CompositeContract with contracts list and operator.
-            request:  Normalised request body.
-            response: Normalised response body.
-
-        Returns:
-            Aggregated EvaluationResult reflecting the combined outcome.
-        """
-        # Evaluate all sub-contracts concurrently.
+        start = time.perf_counter()
         sub_results: list[EvaluationResult] = await asyncio.gather(
             *[evaluate_contract(sub, request, response) for sub in contract.contracts]
         )
 
         failures = [r for r in sub_results if not r.passed]
+        avg_compliance = (
+            sum(r.compliance_score for r in sub_results) / len(sub_results)
+            if sub_results else 1.0
+        )
+
+        # Determine the highest-cost tier among sub-contracts
+        tier_order = {EvaluationTier.DETERMINISTIC: 0, EvaluationTier.CLASSIFIER: 1, EvaluationTier.LLM_JUDGE: 2}
+        max_tier = max(sub_results, key=lambda r: tier_order.get(r.evaluation_tier, 0)).evaluation_tier if sub_results else EvaluationTier.DETERMINISTIC
 
         if contract.operator == "OR":
-            # OR: fail if ANY sub-contract fails.
             if failures:
                 return EvaluationResult(
                     passed=False,
                     action=contract.action,
                     contract_id=contract.id,
+                    evaluation_tier=max_tier,
+                    compliance_score=avg_compliance,
+                    latency_ms=(time.perf_counter() - start) * 1000,
                     violation=ViolationDetail(
                         contract_id=contract.id,
                         message=(
-                            f"Composite (OR) contract violated: "
+                            f"Composite (OR) violated: "
                             f"{len(failures)}/{len(sub_results)} sub-contracts failed"
                         ),
                         evidence=failures[0].violation.message if failures[0].violation else None,
                     ),
                 )
         else:
-            # AND: fail only if ALL sub-contracts fail.
             if len(failures) == len(sub_results):
                 return EvaluationResult(
                     passed=False,
                     action=contract.action,
                     contract_id=contract.id,
+                    evaluation_tier=max_tier,
+                    compliance_score=avg_compliance,
+                    latency_ms=(time.perf_counter() - start) * 1000,
                     violation=ViolationDetail(
                         contract_id=contract.id,
                         message=(
-                            f"Composite (AND) contract violated: "
+                            f"Composite (AND) violated: "
                             f"all {len(sub_results)} sub-contracts failed"
                         ),
                     ),
                 )
 
-        return EvaluationResult(passed=True, action=None, contract_id=contract.id)
+        return EvaluationResult(
+            passed=True, action=None, contract_id=contract.id,
+            evaluation_tier=max_tier,
+            compliance_score=avg_compliance,
+            latency_ms=(time.perf_counter() - start) * 1000,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Top-level dispatcher
+# Dispatch table and top-level dispatcher
 # ---------------------------------------------------------------------------
 
-# Dispatch table: contract type → evaluator instance.
-# Instances are created once (they're stateless) and reused.
 _EVALUATORS: dict[str, Any] = {
-    ContractType.KEYWORD:   KeywordEvaluator(),
-    ContractType.REGEX:     RegexEvaluator(),
-    ContractType.SENTIMENT: SentimentEvaluator(),
-    ContractType.SCHEMA:    SchemaEvaluator(),
-    ContractType.COMPOSITE: CompositeEvaluator(),
+    ContractType.KEYWORD:        KeywordEvaluator(),
+    ContractType.REGEX:          RegexEvaluator(),
+    ContractType.LENGTH_LIMIT:   LengthLimitEvaluator(),
+    ContractType.LANGUAGE_MATCH: LanguageMatchEvaluator(),
+    ContractType.SENTIMENT:      SentimentEvaluator(),
+    ContractType.TOPIC_BOUNDARY: TopicBoundaryEvaluator(),
+    ContractType.LLM_JUDGE:      LLMJudgeEvaluator(),
+    ContractType.SCHEMA:         SchemaEvaluator(),
+    ContractType.COMPOSITE:      CompositeEvaluator(),
 }
 
 
@@ -543,24 +901,8 @@ async def evaluate_contract(
     request: dict,
     response: dict,
 ) -> EvaluationResult:
-    """
-    Route `contract` to the appropriate evaluator based on its type discriminator.
-
-    This is the single entry point used by ContractRegistry.evaluate().
-
-    Args:
-        contract: Any concrete contract subtype.
-        request:  Normalised request body.
-        response: Normalised response body.
-
-    Returns:
-        EvaluationResult from the matched evaluator.
-
-    Raises:
-        ValueError: If the contract type is not recognised.
-    """
+    """Route contract to the appropriate evaluator based on its type."""
     evaluator = _EVALUATORS.get(contract.type)
     if evaluator is None:
         raise ValueError(f"No evaluator registered for contract type: {contract.type!r}")
-
     return await evaluator.evaluate(contract, request, response)

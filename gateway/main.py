@@ -20,7 +20,7 @@ from __future__ import annotations
 import time        # for measuring how long each stage takes
 import uuid        # for generating unique request IDs
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import redis.asyncio as aioredis          # async Redis client
 import structlog                           # structured JSON logging (better than print())
@@ -34,6 +34,7 @@ from gateway.router import ProviderRouter
 from gateway.security.guard import SecurityGuard
 from gateway.cache.semantic_cache import SemanticCache
 from gateway.contracts.registry import ContractRegistry
+from gateway.contracts.drift import DriftDetector
 from gateway.observability.langfuse_client import LangfuseClient
 from gateway.observability.metrics import MetricsCollector
 
@@ -270,12 +271,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await semantic_cache.warm_up()
         log.info("Semantic cache ready", index_size=semantic_cache._store.size)
 
-    # --- Step 5: Contract registry ---
+    # --- Step 5: Drift detector + Contract registry ---
     #
-    # load() scans the "contracts/" directory for JSON/YAML files and parses
-    # each one into a ContractDefinition.  Non-fatal: files that fail to parse
-    # are skipped with a warning.
-    contract_registry = ContractRegistry("contracts/")
+    # The DriftDetector tracks compliance scores over time in Redis sorted
+    # sets and fires alerts when behavioral compliance degrades.
+    #
+    # The ContractRegistry receives the drift detector so it can record
+    # compliance scores from every evaluation automatically.
+    drift_detector = None
+    if settings.contracts.drift_enabled:
+        drift_detector = DriftDetector(
+            redis_client=redis_client,
+            recent_window_hours=settings.contracts.drift_recent_window_hours,
+            baseline_window_hours=settings.contracts.drift_baseline_window_hours,
+            alert_threshold=settings.contracts.drift_alert_threshold,
+            retention_days=settings.contracts.drift_retention_days,
+            min_samples=settings.contracts.drift_min_samples,
+        )
+        log.info("Drift detector initialized")
+
+    contract_registry = ContractRegistry(
+        contracts_dir=settings.contracts.contracts_dir,
+        drift_detector=drift_detector,
+    )
     contract_registry.load()
     log.info("Contract registry loaded", apps=contract_registry.list_apps())
 
@@ -312,6 +330,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.security_guard = security_guard
     app.state.semantic_cache = semantic_cache
     app.state.contract_registry = contract_registry
+    app.state.drift_detector = drift_detector
     app.state.provider_router = provider_router
     app.state.langfuse = langfuse_client
     app.state.metrics = metrics
@@ -332,8 +351,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     log.info("Shutting down AI Gateway...")
 
+    # Wait for any in-flight background contract evaluations to finish
+    # so their compliance scores are recorded before we close Redis.
+    await contract_registry.shutdown()
+
     # Flush any Langfuse events that are buffered in memory.
-    # Without this, traces for the last few requests before shutdown are lost.
     langfuse_client.flush()
 
     # Persist the FAISS index to disk so the cache survives the restart.
@@ -743,17 +765,21 @@ async def proxy_request(request: Request) -> Response:
     provider_latency_ms = (time.perf_counter() - provider_start) * 1000
 
     # -----------------------------------------------------------------------
-    # Stage 8: Behavioral contract evaluation
+    # Stage 8: Behavioral contract evaluation (tiered execution)
     #
-    # Behavioral contracts are rules the application owner defines to ensure
-    # the LLM's responses meet their requirements.  Examples:
-    #   - "Never mention competitor brand names"
-    #   - "All responses must be in JSON format"
-    #   - "Sentiment must be >= 0.3 (not hostile)"
+    # Contracts are split by action into two execution paths:
     #
-    # We evaluate all contracts registered for this app_id.
-    # If any BLOCK-action contract is violated, we return HTTP 422.
-    # WARN-action violations are logged but the response is still returned.
+    #   BLOCK contracts: evaluated synchronously in parallel (~1-15ms).
+    #     Only deterministic and classifier tier checks should use BLOCK.
+    #     If any fails, the response is rejected with HTTP 422.
+    #
+    #   FLAG/LOG contracts: fired as a background asyncio.Task (~0ms added).
+    #     The user receives the response immediately.  Violations are logged
+    #     to Langfuse and compliance scores feed into the drift detector.
+    #     LLM judge contracts should always use FLAG.
+    #
+    # This means users experience at most ~15ms of added latency while still
+    # getting full behavioral monitoring via the background path.
     # -----------------------------------------------------------------------
     contract_report = await contract_registry.evaluate(
         app_id=app_id,
@@ -762,11 +788,14 @@ async def proxy_request(request: Request) -> Response:
     )
 
     if contract_report.blocked:
-        # A BLOCK-action contract was violated.
-        # We do NOT return the provider's response — it violated the rules.
         metrics.record_contract_violation()
         violated_ids = [v.contract_id for v in contract_report.violations]
-        log.warning("Contract violation — response blocked", contracts=violated_ids, app_id=app_id)
+        log.warning(
+            "Contract violation — response blocked",
+            contracts=violated_ids,
+            app_id=app_id,
+            eval_ms=round(contract_report.evaluation_ms, 2),
+        )
 
         return JSONResponse(
             status_code=422,
@@ -814,6 +843,9 @@ async def proxy_request(request: Request) -> Response:
             "cache": "MISS",
             "security_tier": guard_result.tier_triggered,
             "contract_violations": len(contract_report.violations),
+            "contract_block_count": contract_report.block_count,
+            "contract_flag_count": contract_report.flag_count,
+            "contract_eval_ms": round(contract_report.evaluation_ms, 2),
         },
     ) as trace:
         # Record the LLM generation with token usage for cost tracking.
@@ -1006,3 +1038,86 @@ async def list_models(request: Request) -> JSONResponse:
             "data": models,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT: GET /v1/contracts/{app_id}/drift
+#
+# Drift detection dashboard for behavioral contracts.  Returns compliance
+# snapshots and any active drift alerts for the specified application.
+#
+# This is the endpoint that makes Covenant's contract layer unique: it
+# answers "is my LLM application drifting from its intended behavior?"
+# in real time, not in a batch eval run hours later.
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/contracts/{app_id}/drift")
+async def get_drift_summary(app_id: str, request: Request) -> JSONResponse:
+    """
+    Return compliance snapshots and drift alerts for an application.
+
+    Requires drift detection to be enabled (CONTRACTS__DRIFT_ENABLED=true).
+    Returns per-contract compliance averages over the recent window,
+    plus any active drift alerts where compliance has dropped.
+    """
+    drift_detector: Optional[DriftDetector] = request.app.state.drift_detector
+    registry: ContractRegistry = request.app.state.contract_registry
+
+    if drift_detector is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": "Drift detection is not enabled.", "type": "configuration_error"}},
+        )
+
+    contract_ids = registry.get_contract_ids(app_id)
+    if not contract_ids:
+        return JSONResponse(
+            content={"app_id": app_id, "contracts": {}, "alerts": [], "alert_count": 0},
+        )
+
+    summary = await drift_detector.get_drift_summary(app_id, contract_ids)
+    return JSONResponse(content=summary)
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT: GET /v1/contracts/{app_id}
+#
+# List all registered contracts for an application.  Useful for the admin
+# dashboard and for debugging contract definitions.
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/contracts/{app_id}")
+async def get_contracts(app_id: str, request: Request) -> JSONResponse:
+    """Return the contract definition for an application."""
+    registry: ContractRegistry = request.app.state.contract_registry
+    definition = registry.get(app_id)
+
+    if definition is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": f"No contracts registered for app_id: {app_id}", "type": "not_found"}},
+        )
+
+    return JSONResponse(content=definition.model_dump(mode="json"))
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT: POST /v1/contracts/{app_id}/reload
+#
+# Hot-reload contracts for a specific application without restarting.
+# ---------------------------------------------------------------------------
+
+@app.post("/v1/contracts/{app_id}/reload")
+async def reload_contracts(app_id: str, request: Request) -> JSONResponse:
+    """Hot-reload the contract file for a specific application."""
+    _authenticate(request, request.app.state.settings)
+    registry: ContractRegistry = request.app.state.contract_registry
+    success = registry.reload(app_id)
+
+    if success:
+        return JSONResponse(content={"status": "reloaded", "app_id": app_id})
+    else:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"message": f"No contract file found for app_id: {app_id}", "type": "not_found"}},
+        )

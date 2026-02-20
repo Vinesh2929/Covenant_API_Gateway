@@ -198,18 +198,24 @@ class MetricsCollector:
         self.contract_violations: int = 0  # responses blocked by contract evaluator
 
         # ---- Security counters ----
-        # Broken out by tier so operators can see the relative contribution.
-        self.injections_blocked_tier1: int = 0   # caught by PatternGuard
-        self.injections_blocked_tier2: int = 0   # caught by MLGuard
+        self.injections_blocked_tier1: int = 0
+        self.injections_blocked_tier2: int = 0
+
+        # ---- Contract counters ----
+        self.contract_blocks: int = 0
+        self.contract_flags: int = 0
+        self.contract_eval_latency: LatencyBuffer = LatencyBuffer(maxlen=1000)
+        self.contract_tier_counts: dict[str, int] = {
+            "deterministic": 0,
+            "classifier": 0,
+            "llm_judge": 0,
+        }
+        self.drift_alerts_total: int = 0
 
         # ---- Global latency buffer ----
-        # Holds the 2000 most recent end-to-end request latencies.
-        # Used to compute p50, p95, p99 across all providers combined.
         self.latency: LatencyBuffer = LatencyBuffer(maxlen=2000)
 
         # ---- Per-provider stats ----
-        # Keyed by provider name string ("openai", "anthropic", "local").
-        # Entries are created lazily on the first record_request() for that provider.
         self.providers: dict[str, ProviderStats] = {}
 
     # -----------------------------------------------------------------------
@@ -281,9 +287,27 @@ class MetricsCollector:
             self.rate_limited += 1
 
     def record_contract_violation(self) -> None:
-        """Increment the behavioral contract violation counter."""
+        """Increment the behavioral contract violation counter (BLOCK action)."""
         with self._lock:
             self.contract_violations += 1
+            self.contract_blocks += 1
+
+    def record_contract_flag(self) -> None:
+        """Increment the contract flag counter (background FLAG action)."""
+        with self._lock:
+            self.contract_flags += 1
+
+    def record_contract_evaluation(self, tier: str, latency_ms: float) -> None:
+        """Record a contract evaluation with its tier and latency."""
+        with self._lock:
+            if tier in self.contract_tier_counts:
+                self.contract_tier_counts[tier] += 1
+            self.contract_eval_latency.add(latency_ms)
+
+    def record_drift_alert(self) -> None:
+        """Increment the drift alert counter."""
+        with self._lock:
+            self.drift_alerts_total += 1
 
     def record_provider_error(self, provider: str) -> None:
         """
@@ -351,7 +375,6 @@ class MetricsCollector:
             }
         """
         with self._lock:
-            # Snapshot scalar counters under the lock.
             total = self.total_requests
             hits = self.cache_hits
             misses = self.cache_misses
@@ -360,7 +383,11 @@ class MetricsCollector:
             t1_blocks = self.injections_blocked_tier1
             t2_blocks = self.injections_blocked_tier2
 
-            # Snapshot per-provider stats (names + counters) under the lock.
+            c_blocks = self.contract_blocks
+            c_flags = self.contract_flags
+            c_tier_counts = dict(self.contract_tier_counts)
+            c_drift_alerts = self.drift_alerts_total
+
             provider_snapshot = {
                 name: {
                     "requests": stats.requests,
@@ -369,7 +396,6 @@ class MetricsCollector:
                 for name, stats in self.providers.items()
             }
 
-            # Snapshot latency sample count under the lock.
             latency_samples = self.latency.count
 
         # Compute derived values OUTSIDE the lock (percentile sorting is slow).
@@ -404,6 +430,15 @@ class MetricsCollector:
                 "tier1_blocks": t1_blocks,
                 "tier2_blocks": t2_blocks,
                 "total_blocks": t1_blocks + t2_blocks,
+            },
+            "contracts": {
+                "blocks": c_blocks,
+                "flags": c_flags,
+                "total_violations": violations,
+                "drift_alerts": c_drift_alerts,
+                "evaluations_by_tier": c_tier_counts,
+                "eval_latency_p50_ms": self.contract_eval_latency.percentile(50),
+                "eval_latency_p95_ms": self.contract_eval_latency.percentile(95),
             },
             "latency_ms": {
                 "p50": self.latency.percentile(50),

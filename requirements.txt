@@ -47,7 +47,10 @@ langfuse==2.53.3                  # official Langfuse Python SDK
 # Contract evaluation
 # ---------------------------------------------------------------------------
 jsonschema==4.23.0                # JSON Schema validation for SchemaContract
+langdetect==1.0.9                 # language detection for LanguageMatchContract
 # sentiment analysis model is loaded via transformers (no extra install needed)
+# zero-shot classification model is loaded via transformers (no extra install needed)
+# LLM judge uses the gateway's own provider system (no extra install needed)
 
 # ---------------------------------------------------------------------------
 # Utilities
