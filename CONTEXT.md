@@ -194,14 +194,13 @@ tests/
 
 ### ⚠️ Remaining / TODO
 
-| Item | Priority | Notes |
-|------|----------|-------|
-| **`scripts/benchmark_security.py`** | High | Load all 3 models, run same eval set, output precision/recall/F1/latency table + PR-curve plot |
-| **`tests/conftest.py` fixtures** | High | `fakeredis`, mock ML guard, fixture contracts — required before any test runs |
-| **Test suite** | High | `test_security.py`, `test_cache.py`, `test_contracts.py`, `test_rate_limiter.py`, `test_router.py` all need real assertions |
-| **`scripts/download_models.py`** | Medium | Script to pull ProtectAI DeBERTa + all-MiniLM-L6-v2 to local `models/` dir |
-| **README.md** | Medium | Currently a skeleton; needs quickstart, architecture diagram, config reference |
-| **Fine-tune loop** | Low | `scripts/train_classifier.py` exists but targets DistilBERT; update for DeBERTa |
+| Item | Status | Notes |
+|------|--------|-------|
+| **`tests/` — full suite** | ✅ Done (63/63 pass) | fakeredis + seeded stub embedder; no external services needed |
+| **`scripts/download_models.py`** | ✅ Done | Downloads ProtectAI DeBERTa + all-MiniLM-L6-v2; optional benchmark models behind `DOWNLOAD_ALL_MODELS` env var |
+| **`scripts/benchmark_security.py`** | ⚠️ Next | Load all 3 models, run same eval set, output precision/recall/F1/latency table; needs benchmark dataset |
+| **README.md** | ⚠️ After benchmark | Needs real numbers at the top before it's worth writing |
+| **Fine-tune loop** | Low | `scripts/train_classifier.py` targets DistilBERT; update for DeBERTa after benchmark establishes baseline |
 
 ---
 
@@ -316,9 +315,9 @@ curl http://localhost/v1/chat/completions \
 
 ### Run tests
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt   # includes lupa (required for fakeredis Lua scripting)
 pytest tests/ -v
-# NOTE: conftest.py fixtures are stubs — most tests will not pass until those are filled in
+# 63/63 tests pass — no real Redis, no real models, no API keys needed
 ```
 
 ---
@@ -332,3 +331,8 @@ pytest tests/ -v
 | 2026-02-19 | Added `gateway/security/patterns.json` | Externalise regex patterns for hot-reload without restart |
 | 2026-02-19 | Committed and pushed to `origin/main` (commit `4cee891`) | Checkpoint working implementation |
 | 2026-02-19 | **Behavioral contracts v2**: 3-tier evaluation (deterministic/classifier/LLM judge), tiered execution (sync BLOCK + async FLAG), drift detection via Redis time series, 4 new contract types (LengthLimit, LanguageMatch, TopicBoundary, LLMJudge), compliance scoring, drift dashboard endpoint | Core differentiator — no other gateway has inline behavioral contract enforcement with drift detection |
+| 2026-02-20 | Merged `feature/behavioral-contracts-v2` and `feature/tests-benchmarks-readme` into main via fast-forward | Both branches were linear on top of main; clean merge with no conflicts |
+| 2026-02-20 | **Test suite fix — StubEmbedder zero-vector bug**: `np.frombuffer(sha256_bytes, dtype=float32)` produces all-zeros for some inputs (e.g. "What is Python?") because those bytes decode to zeros as IEEE 754 float32. Fixed by using seeded numpy RNG — `np.random.default_rng(seed).standard_normal(32)` — for proper Gaussian unit vectors. EMBED_DIM 8→32 for better inter-prompt separation. | 3 cache tests were failing silently because zero-vector embeddings always had cosine similarity 0.0, below the 0.92 threshold |
+| 2026-02-20 | **Test suite fix — fakeredis Lua scripting**: `fakeredis` does not support `SCRIPT LOAD` / `EVALSHA` by default. The rate-limiter uses a Lua script for atomicity. Fixed by adding `lupa` (Lua runtime) to `requirements-dev.txt` — fakeredis ≥ 2.20 auto-enables Lua when lupa is installed. | 8 rate-limiter tests were erroring at fixture setup with `unknown command 'script'` |
+| 2026-02-20 | `scripts/download_models.py` written and merged | Blocks gateway cold-start without models; now runnable with `python scripts/download_models.py` |
+| 2026-02-20 | **All 63 tests pass** on main. No real Redis, no real models, no API keys required to run the suite. | — |
