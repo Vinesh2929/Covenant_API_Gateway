@@ -234,13 +234,13 @@ Tier-2 classifier instead of fine-tuning DistilBERT from scratch.
 
 **Benchmark candidates (run via `scripts/benchmark_security.py`):**
 
-| Model | Params | CPU latency (sequential) | Notes |
-|-------|--------|--------------------------|-------|
-| ProtectAI deberta-v3-base-v2 | 184 M | ~80 ms / ~3ms GPU | **Measured**: p50=81ms, p99=287ms (50-sample warmup, Apple M-series) |
-| Meta Prompt Guard 2 86M | 86 M | ~50 ms (est.) | Not yet benchmarked |
-| Meta Prompt Guard 2 22M | 22 M | ~15 ms (est.) | Not yet benchmarked |
+| Model | Params | p50 CPU | p99 CPU | Precision | Recall | F1 | RPS |
+|-------|--------|---------|---------|-----------|--------|----|-----|
+| ProtectAI deberta-v3-base-v2 | 184 M | **73ms** | 188ms | 1.000 | **0.429** | **0.600** | 12.6 |
+| Meta Prompt Guard 2 86M | 86 M | 74ms | 129ms | 1.000 | 0.246 | 0.395 | 13.0 |
+| Meta Prompt Guard 2 22M | 22 M | **32ms** | **126ms** | 1.000 | 0.212 | 0.350 | **25.9** |
 
-All CPU numbers are sequential single-sample. ONNX + int8 quantization brings DeBERTa-v3 to ~15–20ms on CPU.
+All measured. 406 samples (deepset/prompt-injections + Alpaca, 50/50), 50-sample warmup, sequential single-sample on Apple M-series CPU. All three models: zero false positives at every threshold tested. ProtectAI DeBERTa-v3 is the clear winner on accuracy; Meta PG2-22M is 2.3× faster but catches half as many injections.
 
 ### 2. Two-tier security (regex + ML)
 
@@ -350,3 +350,4 @@ pytest tests/ -v
 | 2026-02-20 | Created `results/` and `data/` directories with `.gitkeep` | Holds benchmark output and dataset; tracked in git so paths exist on fresh clone |
 | 2026-02-22 | **Benchmark run — real numbers collected** on 406 samples (deepset/prompt-injections + Alpaca, 50/50, seed 42, CPU): ProtectAI DeBERTa-v3 at threshold=0.5 → precision=1.0000, recall=0.4286, F1=0.6000, p50=103.6ms, p99=261.5ms, 9.1 RPS. Key insight: model outputs are strongly bimodal — 114/203 injection samples score < 0.10 (indirect/subtle attacks), 73 score > 0.99, zero FP at any threshold. Validates two-tier approach. | —
 | 2026-02-22 | **README.md** written with real benchmark numbers, full architecture, configuration reference, API docs, deployment notes | —
+| 2026-02-22 | **Full three-model benchmark completed** — Meta PromptGuard-2 86M and 22M benchmarked alongside ProtectAI DeBERTa-v3. All three: precision=1.000, zero FP. Recall: DeBERTa 0.429 > PG2-86M 0.246 > PG2-22M 0.212. Latency: PG2-22M fastest (p50=32ms), DeBERTa and PG2-86M similar (~73-74ms p50). ProtectAI DeBERTa-v3 confirmed as best accuracy model; PG2-22M fastest. README and CONTEXT.md updated with full table. | —

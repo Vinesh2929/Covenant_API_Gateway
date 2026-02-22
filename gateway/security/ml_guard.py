@@ -20,14 +20,16 @@ MODEL STRATEGY — WHY DeBERTa, NOT DistilBERT FROM SCRATCH?
 
 BENCHMARK COMPARISON (run via scripts/benchmark_security.py):
 
-  Model                              Params   CPU latency (sequential)   Notes
-  ─────────────────────────────────  ───────  ────────────────────────   ──────────────────────────────────
-  ProtectAI deberta-v3-base-v2       184 M    ~100 ms / ~3 ms GPU        Measured: p50=103ms, p99=262ms
-  Meta Prompt Guard 2 86M            86 M     ~50 ms (est.)              Not yet benchmarked
-  Meta Prompt Guard 2 22M            22 M     ~15 ms (est.)              Not yet benchmarked
+  Model                              Params   p50 CPU   p99 CPU   Precision  Recall   F1
+  ─────────────────────────────────  ───────  ────────  ────────  ─────────  ──────   ──────
+  ProtectAI deberta-v3-base-v2       184 M    ~73 ms    ~188 ms   1.000      0.429    0.600   ← default
+  Meta Prompt Guard 2 86M            86 M     ~74 ms    ~129 ms   1.000      0.246    0.395
+  Meta Prompt Guard 2 22M            22 M     ~32 ms    ~126 ms   1.000      0.212    0.350
 
-  All CPU numbers are sequential single-sample inference on Apple M-series.
-  With ONNX + int8 quantization, DeBERTa-v3 reaches ~15-20ms on CPU.
+  All measured: 406 samples (deepset/prompt-injections + Alpaca 50/50), 50-sample warmup,
+  sequential single-sample inference on Apple M-series CPU. Zero false positives across all
+  three models at every threshold tested (0.05–0.99).
+  ONNX + int8 quantization would bring DeBERTa-v3 to ~15-20ms on CPU.
 
   Run all three on the same test set. Measure precision, recall, F1, and
   per-prompt CPU latency. The benchmark script writes a PR-curve plot and
