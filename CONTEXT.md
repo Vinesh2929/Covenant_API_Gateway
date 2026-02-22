@@ -206,7 +206,7 @@ tests/
 | **`scripts/download_models.py`** | ✅ Done | Downloads ProtectAI DeBERTa + all-MiniLM-L6-v2; optional benchmark models behind `DOWNLOAD_ALL_MODELS` env var |
 | **`scripts/build_benchmark_dataset.py`** | ✅ Done | Pulls deepset/prompt-injections + tatsu-lab/alpaca, 50/50 balance, writes JSONL to `data/benchmark_dataset.jsonl` |
 | **`scripts/benchmark_security.py`** | ✅ Done | Three-model comparison (ProtectAI DeBERTa-v3, Meta PG2 86M/22M); warmup, latency percentiles, PR curve, JSON output to `results/` |
-| **README.md** | ⚠️ Next | Run benchmark to get real numbers, then write README around them |
+| **README.md** | ✅ Done | Written around real benchmark numbers |
 | **Fine-tune loop** | Low | `scripts/train_classifier.py` targets DistilBERT; update for DeBERTa after benchmark establishes baseline |
 
 ---
@@ -346,3 +346,5 @@ pytest tests/ -v
 | 2026-02-20 | **`scripts/build_benchmark_dataset.py`** written — pulls deepset/prompt-injections (injection) + tatsu-lab/alpaca (clean), 50/50 balance, JSONL output to `data/benchmark_dataset.jsonl` | Needed before benchmark can run; decoupled from benchmark itself so dataset is built once |
 | 2026-02-20 | **`scripts/benchmark_security.py`** fully implemented — three-model comparison (ProtectAI DeBERTa-v3, Meta PromptGuard 86M, Meta PromptGuard 22M), 10-sample warmup before timing, per-sample `time.perf_counter()` latencies, p50/p95/p99, sklearn precision/recall/F1, PR curve sweep, results to `results/benchmark_results.json` | Produces the real numbers needed for README; Meta models gated behind `--all-models` flag + require HF login + Llama license |
 | 2026-02-20 | Created `results/` and `data/` directories with `.gitkeep` | Holds benchmark output and dataset; tracked in git so paths exist on fresh clone |
+| 2026-02-22 | **Benchmark run — real numbers collected** on 406 samples (deepset/prompt-injections + Alpaca, 50/50, seed 42, CPU): ProtectAI DeBERTa-v3 at threshold=0.5 → precision=1.0000, recall=0.4286, F1=0.6000, p50=103.6ms, p99=261.5ms, 9.1 RPS. Key insight: model outputs are strongly bimodal — 114/203 injection samples score < 0.10 (indirect/subtle attacks), 73 score > 0.99, zero FP at any threshold. Validates two-tier approach. | —
+| 2026-02-22 | **README.md** written with real benchmark numbers, full architecture, configuration reference, API docs, deployment notes | —
