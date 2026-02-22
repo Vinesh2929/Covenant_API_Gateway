@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-02-22T19:44:10Z",
+  "generated_at": "2026-02-22T20:05:56Z",
   "models": [
     {
       "model_name": "ProtectAI-DeBERTa-v3",
@@ -13,11 +13,11 @@
       "fp": 0,
       "tn": 203,
       "fn": 116,
-      "latency_p50_ms": 103.64547953940928,
-      "latency_p95_ms": 149.62957322131842,
-      "latency_p99_ms": 261.4592669182454,
-      "throughput_rps": 9.086631183466908,
-      "total_time_s": 44.68102554208599
+      "latency_p50_ms": 81.34081249590963,
+      "latency_p95_ms": 127.17913548112847,
+      "latency_p99_ms": 287.2222795383997,
+      "throughput_rps": 11.188354491798801,
+      "total_time_s": 36.28773116704542
     }
   ],
   "pr_curves": {

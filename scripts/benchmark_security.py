@@ -69,7 +69,7 @@ _ALL_MODELS: dict[str, str] = {
     "Meta-PromptGuard-22M": "meta-llama/Llama-Prompt-Guard-2-22M",
 }
 
-_WARMUP_N = 10       # samples to run before recording latency (JIT warm-up)
+_WARMUP_N = 50       # samples to run before recording latency (JIT warm-up)
 _BATCH_SIZE = 32     # inference batch size
 
 
@@ -391,6 +391,13 @@ def print_table(results: list[dict]) -> None:
     print(row("Throughput",   [f"{r['throughput_rps']:.1f} rps" for r in results]))
     print(row("Threshold",    [f"{r['threshold']}"           for r in results]))
     print(sep)
+    print(
+        "  Note: sequential single-sample CPU inference. Each sample timed individually\n"
+        "  with time.perf_counter() after a 50-sample warmup. In production,\n"
+        "  run_in_executor dispatches concurrent requests to a thread pool — per-request\n"
+        "  latency is the same, but multiple requests can be in-flight simultaneously.\n"
+        "  For lower latency: GPU ~3ms; ONNX + int8 quantization ~15-20ms on CPU."
+    )
     print()
 
 

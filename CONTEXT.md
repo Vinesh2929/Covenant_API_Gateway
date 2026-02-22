@@ -14,7 +14,7 @@ it reaches the model, and every response is validated before it goes back to the
 
 **Core value proposition:**
 - Drop-in OpenAI-compatible API (`/v1/chat/completions`)
-- Prompt injection detection — two-tier, sub-20 ms on CPU
+- Prompt injection detection — two-tier; regex Tier 1 < 1ms, DeBERTa-v3 Tier 2 ~80ms CPU (sequential) / ~3ms GPU
 - Semantic response caching — FAISS + Redis, ~98% cache-hit savings on repeated queries
 - Behavioral contracts — per-app rules that block/log bad model outputs
 - Full observability — Prometheus metrics + Langfuse distributed traces
@@ -138,7 +138,7 @@ tests/
 #### Security — Tier 2 (`gateway/security/ml_guard.py`)
 - **Model: ProtectAI/deberta-v3-base-prompt-injection-v2** (184 M params)
   - Chosen after benchmarking three candidates (see decision log below)
-  - ~15 ms CPU latency per prompt; ~98% precision at 95% recall (public datasets)
+  - ~80 ms CPU latency per prompt (sequential single-sample, measured); ~98% precision at 95% recall (ProtectAI published numbers on public datasets)
 - Deferred load via `warm_up()` → `run_in_executor` (keeps startup fast)
 - Graceful degradation: if model not downloaded, returns `is_injection=False` and logs a warning
 - `_select_device()`: CUDA → MPS (Apple Silicon) → CPU priority
@@ -234,11 +234,13 @@ Tier-2 classifier instead of fine-tuning DistilBERT from scratch.
 
 **Benchmark candidates (run via `scripts/benchmark_security.py`):**
 
-| Model | Params | CPU latency | Notes |
-|-------|--------|------------|-------|
-| ProtectAI deberta-v3-base-v2 | 184 M | ~15 ms | Most widely deployed |
-| Meta Prompt Guard 2 86M | 86 M | ~8 ms | Multilingual, Meta-backed |
-| Meta Prompt Guard 2 22M | 22 M | ~3 ms | Fastest; small accuracy trade-off |
+| Model | Params | CPU latency (sequential) | Notes |
+|-------|--------|--------------------------|-------|
+| ProtectAI deberta-v3-base-v2 | 184 M | ~80 ms / ~3ms GPU | **Measured**: p50=81ms, p99=287ms (50-sample warmup, Apple M-series) |
+| Meta Prompt Guard 2 86M | 86 M | ~50 ms (est.) | Not yet benchmarked |
+| Meta Prompt Guard 2 22M | 22 M | ~15 ms (est.) | Not yet benchmarked |
+
+All CPU numbers are sequential single-sample. ONNX + int8 quantization brings DeBERTa-v3 to ~15–20ms on CPU.
 
 ### 2. Two-tier security (regex + ML)
 
@@ -246,7 +248,7 @@ Tier-2 classifier instead of fine-tuning DistilBERT from scratch.
 pattern guard passes (not CRITICAL/HIGH).
 
 **Why:**
-- The ML model takes 3–15 ms per prompt. Patterns take < 0.1 ms.
+- The ML model takes ~80 ms per prompt on CPU (sequential). Patterns take < 0.1 ms.
 - Most real-world injection attempts use known phrases (`ignore previous instructions`,
   `you are now DAN`, etc.) — patterns catch these instantly.
 - The ML model handles the ambiguous middle ground: paraphrased attacks, indirect

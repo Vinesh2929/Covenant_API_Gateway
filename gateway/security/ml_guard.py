@@ -20,11 +20,14 @@ MODEL STRATEGY — WHY DeBERTa, NOT DistilBERT FROM SCRATCH?
 
 BENCHMARK COMPARISON (run via scripts/benchmark_security.py):
 
-  Model                              Params   CPU latency   Notes
-  ─────────────────────────────────  ───────  ───────────   ──────────────────────
-  ProtectAI deberta-v3-base-v2       184 M    ~15 ms        Most widely deployed
-  Meta Prompt Guard 2 86M            86 M     ~8 ms         Multilingual, Meta-backed
-  Meta Prompt Guard 2 22M            22 M     ~3 ms         Fastest, small acc. trade-off
+  Model                              Params   CPU latency (sequential)   Notes
+  ─────────────────────────────────  ───────  ────────────────────────   ──────────────────────────────────
+  ProtectAI deberta-v3-base-v2       184 M    ~100 ms / ~3 ms GPU        Measured: p50=103ms, p99=262ms
+  Meta Prompt Guard 2 86M            86 M     ~50 ms (est.)              Not yet benchmarked
+  Meta Prompt Guard 2 22M            22 M     ~15 ms (est.)              Not yet benchmarked
+
+  All CPU numbers are sequential single-sample inference on Apple M-series.
+  With ONNX + int8 quantization, DeBERTa-v3 reaches ~15-20ms on CPU.
 
   Run all three on the same test set. Measure precision, recall, F1, and
   per-prompt CPU latency. The benchmark script writes a PR-curve plot and
@@ -390,8 +393,9 @@ class MLGuard:
           — faster than CPU but typically slower than a dedicated NVIDIA GPU.
           CPU is the safe fallback that always works.
 
-          DeBERTa-v3-base on CPU: ~15 ms per prompt (typical gateway workload).
-          DeBERTa-v3-base on GPU: ~2-3 ms per prompt.
+          DeBERTa-v3-base on CPU: ~100 ms per prompt (sequential single-sample,
+          measured; ONNX + int8 quantization brings this to ~15-20 ms on CPU).
+          DeBERTa-v3-base on GPU: ~2-5 ms per prompt.
 
         Returns:
             A torch device string: "cuda", "mps", or "cpu".

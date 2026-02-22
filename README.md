@@ -8,17 +8,19 @@ Drop-in OpenAI-compatible API (`/v1/chat/completions`). Sits in front of OpenAI,
 
 ## Benchmark — Prompt Injection Detection
 
-Measured on 406 samples (203 injection, 203 clean). Dataset: [deepset/prompt-injections](https://huggingface.co/datasets/deepset/prompt-injections) + [tatsu-lab/alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca), 50/50 balance, seed 42. Latency measured on CPU (Apple M-series), 10-sample warmup, per-sample `time.perf_counter()`.
+Measured on 406 samples (203 injection, 203 clean). Dataset: [deepset/prompt-injections](https://huggingface.co/datasets/deepset/prompt-injections) + [tatsu-lab/alpaca](https://huggingface.co/datasets/tatsu-lab/alpaca), 50/50 balance, seed 42. Latency: sequential single-sample CPU inference (Apple M-series), 50-sample warmup, per-sample `time.perf_counter()`.
 
 | Model | Precision | Recall | F1 | p50 ms | p99 ms | RPS |
 | --- | --- | --- | --- | --- | --- | --- |
-| ProtectAI DeBERTa-v3 | **1.0000** | 0.4286 | 0.6000 | 103.6 | 261.5 | 9.1 |
+| ProtectAI DeBERTa-v3 | **1.0000** | 0.4286 | 0.6000 | 81.3 | 287.2 | 11.2 |
 
 **What these numbers mean:**
 
 - **Precision 1.00** — zero false positives. Not a single clean Alpaca prompt was flagged across 203 samples and every threshold tested (0.05–0.99). The model only fires when it's certain.
 - **Recall 0.43** — the model is conservative. The 57% it misses are indirect/subtle injection patterns (context manipulation, goal hijacking) rather than direct "ignore previous instructions" attacks. Those are caught by Tier 1 (regex) before reaching the ML model.
 - **The two tiers complement each other.** Tier 1 regex patterns handle keyword-based attacks in < 1ms and short-circuit before the ML model is ever called. Tier 2 ML handles the ambiguous paraphrased attacks that have no obvious keywords.
+
+**Methodology:** These are sequential single-sample numbers — the benchmark calls one sample at a time in a loop, not concurrently. In production, `run_in_executor` dispatches each inference call to a thread pool, so multiple requests can be in-flight simultaneously (per-request latency stays the same; throughput scales with CPU cores and thread pool size). To reduce per-request latency: a GPU brings Tier 2 to ~3ms; ONNX export + int8 quantization reaches ~15–20ms on CPU.
 
 ---
 
