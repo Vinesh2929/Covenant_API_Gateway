@@ -106,6 +106,28 @@ class SecuritySettings(BaseSettings):
         description="Minimum model confidence to block a request",
     )
 
+    # Tier 3 — LLM judge (async, non-blocking, observational only)
+    llm_guard_enabled: bool = Field(
+        False,
+        description="Enable async LLM judge for Tier-2 ambiguous-score prompts",
+    )
+    llm_guard_model: str = Field(
+        "claude-haiku-4-5-20251001",
+        description="Judge model ID (claude-haiku-4-5-20251001 or gpt-4o-mini recommended)",
+    )
+    llm_guard_low_threshold: float = Field(
+        0.05,
+        ge=0.0,
+        le=1.0,
+        description="Lower bound of Tier-2 score range that triggers the LLM judge",
+    )
+    llm_guard_high_threshold: float = Field(
+        0.40,
+        ge=0.0,
+        le=1.0,
+        description="Upper bound of Tier-2 score range that triggers the LLM judge",
+    )
+
     @field_validator("ml_confidence_threshold")
     @classmethod
     def validate_threshold(cls, v: float) -> float:

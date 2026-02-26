@@ -140,6 +140,7 @@ def security_guard(settings, pattern_guard, ml_guard_stub):
     guard._settings = settings.security
     guard._pattern_guard = pattern_guard
     guard._ml_guard = ml_guard_stub
+    guard._llm_guard = None  # Tier 3 disabled in tests (no API key)
     guard._dry_run = False
     return guard
 

@@ -1,17 +1,21 @@
 """
 gateway/security/guard.py
 
-Orchestrates the two-tier prompt injection detection pipeline and exposes a
+Orchestrates the three-tier prompt injection detection pipeline and exposes a
 single, clean `scan()` interface to the rest of the gateway.
 
 Responsibilities:
-  - Instantiate and own both PatternGuard (Tier 1) and MLGuard (Tier 2).
+  - Instantiate and own PatternGuard (Tier 1), MLGuard (Tier 2), and
+    optionally LLMGuard (Tier 3).
   - Implement the short-circuit logic: if Tier 1 detects an injection, skip
     the more expensive Tier 2 ML inference entirely.
   - Merge results from both tiers into a unified GuardResult dataclass.
   - Apply configurable severity policies:
       * Pattern severity < threshold → run ML as second opinion.
       * Pattern severity >= threshold → block immediately, skip ML.
+  - Fire Tier 3 as a background asyncio task (fire-and-forget) when Tier 2
+    scores fall in the ambiguous zone [llm_guard_low_threshold, llm_guard_high_threshold].
+    Tier 3 is purely observational — it logs results but never blocks.
   - Support "dry run" mode where injections are logged but not blocked (useful
     during classifier evaluation and policy tuning).
   - Expose the warm_up() method that delegates to MLGuard.warm_up() for use in
@@ -20,20 +24,27 @@ Responsibilities:
 Key classes / functions:
   - GuardResult              — unified result from the full scan pipeline
   - SecurityGuard            — main orchestrator class
-    - __init__(settings)     — instantiate both guards with settings
+    - __init__(settings)     — instantiate all guard tiers with settings
     - warm_up()              — async: warm up the ML model
     - scan(text)             — async: run full pipeline, return GuardResult
     - _should_run_ml()       — internal: decide whether to invoke Tier 2
+    - _run_llm_judge()       — internal async: Tier 3 background task
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
 from typing import Optional
+
+import structlog
 
 from gateway.config import SecuritySettings
 from gateway.security.pattern_guard import PatternGuard, PatternMatch, PatternSeverity
 from gateway.security.ml_guard import MLGuard, ScanResult
+from gateway.security.llm_guard import LLMGuard, LLMJudgeResult
+
+logger = structlog.get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +62,11 @@ class GuardResult:
         tier_triggered:   Which tier made the blocking decision: 1, 2, or None.
         pattern_match:    PatternMatch from Tier 1 (None if no pattern triggered).
         ml_result:        ScanResult from Tier 2 (None if ML was skipped).
-        total_latency_ms: Wall-clock time for the combined scan.
+        llm_result:       LLMJudgeResult from Tier 3 (None — always None at return
+                          time because Tier 3 runs asynchronously in the background).
+                          Present only in tests that directly await _run_llm_judge().
+        total_latency_ms: Wall-clock time for Tier 1 + Tier 2 (excludes Tier 3,
+                          which runs after the response is returned to the caller).
     """
     blocked: bool
     reason: str
@@ -59,6 +74,7 @@ class GuardResult:
     pattern_match: Optional[PatternMatch]
     ml_result: Optional[ScanResult]
     total_latency_ms: float
+    llm_result: Optional[LLMJudgeResult] = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -104,13 +120,16 @@ class SecurityGuard:
     # model for a "second opinion" would just add latency with no benefit.
     _IMMEDIATE_BLOCK_SEVERITIES = {PatternSeverity.HIGH, PatternSeverity.CRITICAL}
 
-    def __init__(self, settings: SecuritySettings) -> None:
+    def __init__(self, settings: SecuritySettings, providers_settings=None) -> None:
         """
-        Initialise both guard tiers from settings.
+        Initialise all guard tiers from settings.
 
         Args:
-            settings: SecuritySettings containing paths, thresholds, and
-                      enabled flags for both tiers.
+            settings:          SecuritySettings containing paths, thresholds, and
+                               enabled flags for all tiers.
+            providers_settings: Optional ProviderSettings forwarded to LLMGuard
+                               for API key resolution. When None, LLMGuard reads
+                               keys from environment variables directly.
         """
         self._settings = settings
 
@@ -121,6 +140,12 @@ class SecurityGuard:
 
         # Tier 2: created but NOT loaded yet.  warm_up() loads the model.
         self._ml_guard = MLGuard(settings)
+
+        # Tier 3: async LLM judge — only instantiated when enabled.
+        # Fires as a background task for ambiguous Tier-2 scores.
+        self._llm_guard: Optional[LLMGuard] = None
+        if settings.llm_guard_enabled:
+            self._llm_guard = LLMGuard(settings, providers_settings)
 
         # Dry-run mode: detect and log injections but never block.
         # Useful when deploying the security guard to a new environment and
@@ -217,6 +242,27 @@ class SecurityGuard:
             # The pattern match is still logged via the returned GuardResult.
 
         # ---------------------------------------------------------------
+        # Tier 3: async LLM judge (fire-and-forget, observational only)
+        # ---------------------------------------------------------------
+        # Triggered when:
+        #   - LLMGuard is instantiated (llm_guard_enabled=True)
+        #   - Tier 2 ran and the score falls in the ambiguous zone
+        #   - The request is NOT already blocked (no point judging confirmed blocks)
+        # The task runs in the background; scan() returns before it completes.
+        if (
+            self._llm_guard is not None
+            and ml_result is not None
+            and not blocked
+            and self._settings.llm_guard_low_threshold
+                <= ml_result.confidence
+                <= self._settings.llm_guard_high_threshold
+        ):
+            asyncio.create_task(
+                self._run_llm_judge(text, ml_result.confidence),
+                name="tier3_judge",
+            )
+
+        # ---------------------------------------------------------------
         # Dry-run override
         # ---------------------------------------------------------------
         if self._dry_run and blocked:
@@ -266,3 +312,51 @@ class SecurityGuard:
         # Pattern matched — run ML only for LOW/MEDIUM severity (not conclusive
         # enough to block without a second opinion).
         return pattern_match.severity not in self._IMMEDIATE_BLOCK_SEVERITIES
+
+    async def _run_llm_judge(self, text: str, tier2_score: float) -> None:
+        """
+        Background Tier 3 task — call the LLM judge and log the result.
+
+        This method is called via asyncio.create_task() from scan() and runs
+        after scan() has already returned a result to the caller.  It is purely
+        observational: it never modifies the GuardResult or blocks any request.
+
+        Log levels:
+          INFO    — judge says benign (or error)
+          WARNING — judge says injection (disagreement with Tier 2)
+
+        Args:
+            text:        The prompt that was scanned.
+            tier2_score: The Tier 2 ML confidence score (for context in logs).
+        """
+        result = await self._llm_guard.judge(text)  # type: ignore[union-attr]
+
+        if result.error:
+            logger.info(
+                "tier3_judge_failed",
+                tier2_score=round(tier2_score, 4),
+                error=result.error,
+                latency_ms=round(result.latency_ms, 1),
+            )
+            return
+
+        if result.is_injection:
+            # Tier 2 said benign (score below threshold), Tier 3 disagrees —
+            # log at WARNING so these samples surface for training data review.
+            logger.warning(
+                "tier3_disagrees_with_tier2",
+                tier2_score=round(tier2_score, 4),
+                tier3_verdict="injection",
+                reason=result.reason,
+                model=result.model,
+                latency_ms=round(result.latency_ms, 1),
+            )
+        else:
+            logger.info(
+                "tier3_agrees_benign",
+                tier2_score=round(tier2_score, 4),
+                tier3_verdict="benign",
+                reason=result.reason,
+                model=result.model,
+                latency_ms=round(result.latency_ms, 1),
+            )
