@@ -3,7 +3,7 @@
 > A self-hostable AI gateway that hardens every LLM request before it reaches the model and every response before it reaches the caller.
 
 Drop-in OpenAI-compatible API (`/v1/chat/completions`). Sits in front of OpenAI, Anthropic, or your own Ollama instance. Adds a security and reliability layer with zero code changes to your application.
-
+Blog: https://www.vineshnathan.ca/covenant
 ---
 
 ## Benchmark — Prompt Injection Detection
